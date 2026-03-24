@@ -1,0 +1,17 @@
+{
+  "name": "fuel-density-map",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,webui -c blue,green \"bun run dev:api\" \"bun --cwd webui dev\"",
+    "dev:api": "bun run server.ts",
+    "build": "bun --cwd webui build",
+    "lint": "bun --cwd webui lint",
+    "start": "bun run server.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "^1.3.11",
+    "concurrently": "^9.2.1"
+  }
+}

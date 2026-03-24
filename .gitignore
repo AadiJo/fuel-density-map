@@ -1,1 +1,6 @@
 __pycache__
+*.pyc
+node_modules
+webui/node_modules
+webui/dist
+sessions
