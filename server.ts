@@ -12,6 +12,13 @@ type BBox = {
   height: number
 }
 
+type Point = {
+  x: number
+  y: number
+}
+
+type FieldQuad = [Point, Point, Point, Point]
+
 type OverlayStats = {
   bbox: {
     x: number
@@ -36,6 +43,7 @@ type SessionRecord = {
   updatedAt: string
   status: SessionStatus
   bbox: BBox | null
+  fieldQuad: FieldQuad | null
   video: {
     fileName: string | null
     width: number | null
@@ -47,6 +55,7 @@ type SessionRecord = {
     transparentFileName: string
     framesDirName: string | null
     rawDataFileName: string
+    fieldMapDataFileName: string | null
     stats: OverlayStats
   } | null
   lastError: string | null
@@ -135,9 +144,102 @@ function denormalizeBBox(box: BBox, width: number, height: number) {
   return { x, y, width: boxWidth, height: boxHeight }
 }
 
+function normalizePoint(input: unknown) {
+  if (!input || typeof input !== 'object') {
+    return null
+  }
+
+  const raw = input as Record<string, unknown>
+  const x = Number(raw.x)
+  const y = Number(raw.y)
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null
+  }
+
+  return {
+    x: clamp(x),
+    y: clamp(y),
+  }
+}
+
+/** [TL, TR, BR, BL] for cv2.getPerspectiveTransform — same heuristic as App.tsx. */
+function orderQuadPoints(points: Point[]): FieldQuad | null {
+  if (points.length !== 4) {
+    return null
+  }
+
+  const sums = points.map((point) => point.x + point.y)
+  const diffs = points.map((point) => point.y - point.x)
+  const tlIdx = sums.indexOf(Math.min(...sums))
+  const brIdx = sums.indexOf(Math.max(...sums))
+  const trIdx = diffs.indexOf(Math.min(...diffs))
+  const blIdx = diffs.indexOf(Math.max(...diffs))
+
+  if (new Set([tlIdx, trIdx, brIdx, blIdx]).size === 4) {
+    return [points[tlIdx], points[trIdx], points[brIdx], points[blIdx]]
+  }
+
+  const sortedByY = [...points].sort((left, right) => {
+    if (left.y !== right.y) {
+      return left.y - right.y
+    }
+    return left.x - right.x
+  })
+
+  const topRow = sortedByY.slice(0, 2).sort((left, right) => left.x - right.x)
+  const bottomRow = sortedByY.slice(2).sort((left, right) => left.x - right.x)
+  if (topRow.length !== 2 || bottomRow.length !== 2) {
+    return null
+  }
+
+  const [topLeft, topRight] = topRow
+  const [bottomLeft, bottomRight] = bottomRow
+  return [topLeft, topRight, bottomRight, bottomLeft]
+}
+
+function normalizeFieldQuad(input: unknown) {
+  if (!Array.isArray(input) || input.length !== 4) {
+    return null
+  }
+
+  const points = input.map(normalizePoint)
+  if (points.some((point) => !point)) {
+    return null
+  }
+
+  return orderQuadPoints(points as Point[])
+}
+
+function bboxFromQuad(quad: FieldQuad, padding = 0.01) {
+  const xs = quad.map((point) => point.x)
+  const ys = quad.map((point) => point.y)
+  const minX = clamp(Math.min(...xs) - padding)
+  const minY = clamp(Math.min(...ys) - padding)
+  const maxX = clamp(Math.max(...xs) + padding)
+  const maxY = clamp(Math.max(...ys) + padding)
+
+  return {
+    x: minX,
+    y: minY,
+    width: Math.max(0.01, maxX - minX),
+    height: Math.max(0.01, maxY - minY),
+  }
+}
+
+function denormalizeFieldQuad(quad: FieldQuad, width: number, height: number) {
+  return quad.map((point) => ({
+    x: Math.round(point.x * width),
+    y: Math.round(point.y * height),
+  }))
+}
+
 async function readSessionRecord(sessionId: string) {
   const content = await readFile(sessionFile(sessionId), 'utf8')
-  return JSON.parse(content) as SessionRecord
+  const parsed = JSON.parse(content) as SessionRecord
+  return {
+    ...parsed,
+    fieldQuad: parsed.fieldQuad ?? null,
+  }
 }
 
 async function writeSessionRecord(record: SessionRecord) {
@@ -146,6 +248,17 @@ async function writeSessionRecord(record: SessionRecord) {
 }
 
 function toClientSession(record: SessionRecord) {
+  const overlayFramesDirName =
+    record.overlay?.framesDirName && existsSync(path.join(sessionDir(record.id), record.overlay.framesDirName))
+      ? record.overlay.framesDirName
+      : null
+  const fieldMapDataFileName =
+    record.overlay?.fieldMapDataFileName && existsSync(path.join(sessionDir(record.id), record.overlay.fieldMapDataFileName))
+      ? record.overlay.fieldMapDataFileName
+      : existsSync(path.join(sessionDir(record.id), 'field-map.json'))
+        ? 'field-map.json'
+        : null
+
   return {
     ...record,
     media: {
@@ -158,8 +271,12 @@ function toClientSession(record: SessionRecord) {
           ? `/media/${record.id}/${encodeURIComponent(record.overlay.transparentFileName)}`
           : null,
       overlayFrameUrlTemplate:
-        record.overlay?.framesDirName
+        overlayFramesDirName
           ? `/media-frame/${record.id}/__FRAME__.webp`
+          : null,
+      fieldMapDataUrl:
+        fieldMapDataFileName
+          ? `/media/${record.id}/${encodeURIComponent(fieldMapDataFileName)}`
           : null,
     },
   }
@@ -270,6 +387,7 @@ async function importSession(url: string) {
     record = await readSessionRecord(id)
     record.youtubeUrl = url
     record.title = metadata.title
+    record.fieldQuad = record.fieldQuad ?? null
     record.video.width = metadata.width
     record.video.height = metadata.height
     record.video.duration = metadata.duration
@@ -287,6 +405,7 @@ async function importSession(url: string) {
       updatedAt: now,
       status: 'downloading',
       bbox: null,
+      fieldQuad: null,
       video: {
         fileName: null,
         width: metadata.width,
@@ -338,15 +457,19 @@ async function processSession(sessionId: string) {
     throw new Error('The session does not have a downloaded video yet.')
   }
 
-  if (!record.bbox) {
-    throw new Error('Draw a bounding box before running the analysis.')
+  const normalizedBBox = record.fieldQuad ? bboxFromQuad(record.fieldQuad) : record.bbox
+  if (!normalizedBBox) {
+    throw new Error('Mark the field borders before running the analysis.')
   }
 
   if (!record.video.width || !record.video.height) {
     throw new Error('Video dimensions are missing. Load the video once and try again.')
   }
 
-  const pixelBox = denormalizeBBox(record.bbox, record.video.width, record.video.height)
+  const pixelBox = denormalizeBBox(normalizedBBox, record.video.width, record.video.height)
+  const pixelQuad = record.fieldQuad
+    ? denormalizeFieldQuad(record.fieldQuad, record.video.width, record.video.height)
+    : null
   const videoPath = path.join(sessionDir(sessionId), record.video.fileName)
 
   record.status = 'processing'
@@ -363,6 +486,12 @@ async function processSession(sessionId: string) {
       sessionDir(sessionId),
       '--bbox',
       `${pixelBox.x},${pixelBox.y},${pixelBox.width},${pixelBox.height}`,
+      ...(pixelQuad
+        ? [
+            '--quad',
+            pixelQuad.map((point) => `${point.x},${point.y}`).join(','),
+          ]
+        : []),
     ])
 
     const statsPath = path.join(sessionDir(sessionId), 'stats.json')
@@ -373,8 +502,10 @@ async function processSession(sessionId: string) {
       transparentFileName: 'overlay-transparent.png',
       framesDirName: 'overlay-frames',
       rawDataFileName: 'raw_data.txt',
+      fieldMapDataFileName: 'field-map.json',
       stats,
     }
+    record.bbox = normalizedBBox
     record.status = 'completed'
     record.updatedAt = new Date().toISOString()
     await writeSessionRecord(record)
@@ -419,10 +550,19 @@ function inferMimeType(fileName: string) {
   return 'application/octet-stream'
 }
 
+function cacheControlForSessionFile(filePath: string) {
+  const base = path.basename(filePath).toLowerCase()
+  if (base.endsWith('.json') || base.endsWith('.txt')) {
+    return 'no-store'
+  }
+  return 'public, max-age=3600'
+}
+
 function createRangeResponse(filePath: string, request: Request, contentType: string) {
   const file = Bun.file(filePath)
   const size = file.size
   const rangeHeader = request.headers.get('range')
+  const cacheControl = cacheControlForSessionFile(filePath)
 
   if (!rangeHeader || !Number.isFinite(size) || size <= 0) {
     return new Response(file, {
@@ -430,6 +570,7 @@ function createRangeResponse(filePath: string, request: Request, contentType: st
         'Content-Type': contentType,
         'Content-Length': String(size),
         'Accept-Ranges': 'bytes',
+        'Cache-Control': cacheControl,
       },
     })
   }
@@ -476,6 +617,7 @@ function createRangeResponse(filePath: string, request: Request, contentType: st
       'Content-Length': String(end - start + 1),
       'Content-Range': `bytes ${start}-${end}/${size}`,
       'Accept-Ranges': 'bytes',
+      'Cache-Control': cacheControl,
     },
   })
 }
@@ -549,8 +691,43 @@ Bun.serve({
 
         const record = await updateSession(bboxMatch[1], (session) => {
           session.bbox = normalizedBBox
+          session.fieldQuad = null
           session.overlay = null
           session.status = normalizedBBox ? 'ready' : 'idle'
+        })
+
+        return json(toClientSession(record))
+      }
+
+      const fieldQuadMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/field-quad$/)
+      if (request.method === 'POST' && fieldQuadMatch) {
+        const body = await parseBody<{ fieldQuad?: FieldQuad | null }>(request)
+        if (!body || typeof body !== 'object' || !('fieldQuad' in body)) {
+          return json({ error: 'Request body must include fieldQuad (or null to clear).' }, { status: 400 })
+        }
+
+        let normalizedFieldQuad: FieldQuad | null
+        if (body.fieldQuad === null) {
+          normalizedFieldQuad = null
+        } else {
+          const normalized = normalizeFieldQuad(body.fieldQuad)
+          if (!normalized) {
+            return json(
+              {
+                error:
+                  'Could not save that field outline. Use four corners in the video frame, or pick slightly wider corners if the shape is too thin.',
+              },
+              { status: 400 },
+            )
+          }
+          normalizedFieldQuad = normalized
+        }
+
+        const record = await updateSession(fieldQuadMatch[1], (session) => {
+          session.fieldQuad = normalizedFieldQuad
+          session.bbox = normalizedFieldQuad ? bboxFromQuad(normalizedFieldQuad) : null
+          session.overlay = null
+          session.status = normalizedFieldQuad ? 'ready' : 'idle'
         })
 
         return json(toClientSession(record))
@@ -606,7 +783,7 @@ Bun.serve({
         return new Response(Bun.file(filePath), {
           headers: {
             'Content-Type': 'image/webp',
-            'Cache-Control': 'public, max-age=31536000, immutable',
+            'Cache-Control': 'private, max-age=0, must-revalidate',
           },
         })
       }

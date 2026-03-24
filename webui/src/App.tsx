@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
 import { api } from './api'
-import type { BBox, DisplayMode, Session, SessionStatus } from './types'
+import type { BBox, DisplayMode, FieldMapData, FieldQuad, Point, Session, SessionStatus } from './types'
 
 const SELECTED_SESSION_STORAGE_KEY = 'fuel-density-map:selected-session'
 const VIEWER_STORAGE_KEY = 'fuel-density-map:viewer'
+const FIELD_ASSET_URL = '/assets/rebuilt-field.png'
 
 function sortSessions(sessions: Session[]) {
   return [...sessions].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
@@ -49,17 +50,6 @@ function statusLabel(status: SessionStatus) {
 
 function clamp(value: number, min = 0, max = 1) {
   return Math.min(Math.max(value, min), max)
-}
-
-function makeBox(start: { x: number; y: number }, end: { x: number; y: number }): BBox {
-  const x = Math.min(start.x, end.x)
-  const y = Math.min(start.y, end.y)
-  return {
-    x,
-    y,
-    width: Math.abs(end.x - start.x),
-    height: Math.abs(end.y - start.y),
-  }
 }
 
 function boxToPixels(box: BBox | null, session: Session | null) {
@@ -113,6 +103,140 @@ function buildOverlayFrameUrl(template: string | null, frameIndex: number) {
   return template.replace('__FRAME__', String(frameIndex))
 }
 
+/** Bust browser cache after re-running the processor (same URL, new file on disk). */
+function cacheBustUrl(url: string, version: string | null | undefined) {
+  if (!version) {
+    return url
+  }
+  const sep = url.includes('?') ? '&' : '?'
+  return `${url}${sep}v=${encodeURIComponent(version)}`
+}
+
+/** Maps four clicked corners to [TL, TR, BR, BL] for OpenCV / processor_cli destination order. */
+function orderQuadPoints(points: Point[]): FieldQuad | null {
+  if (points.length !== 4) {
+    return null
+  }
+
+  const sums = points.map((point) => point.x + point.y)
+  const diffs = points.map((point) => point.y - point.x)
+  const tlIdx = sums.indexOf(Math.min(...sums))
+  const brIdx = sums.indexOf(Math.max(...sums))
+  const trIdx = diffs.indexOf(Math.min(...diffs))
+  const blIdx = diffs.indexOf(Math.max(...diffs))
+
+  if (new Set([tlIdx, trIdx, brIdx, blIdx]).size === 4) {
+    return [points[tlIdx], points[trIdx], points[brIdx], points[blIdx]]
+  }
+
+  const sortedByY = [...points].sort((left, right) => {
+    if (left.y !== right.y) {
+      return left.y - right.y
+    }
+    return left.x - right.x
+  })
+
+  const topRow = sortedByY.slice(0, 2).sort((left, right) => left.x - right.x)
+  const bottomRow = sortedByY.slice(2).sort((left, right) => left.x - right.x)
+  if (topRow.length !== 2 || bottomRow.length !== 2) {
+    return null
+  }
+
+  const [topLeft, topRight] = topRow
+  const [bottomLeft, bottomRight] = bottomRow
+  return [topLeft, topRight, bottomRight, bottomLeft]
+}
+
+function readPointFromPointerEvent(
+  event: React.PointerEvent<HTMLDivElement>,
+  video: HTMLVideoElement | null,
+  fallbackRect: DOMRect | null,
+): Point | null {
+  const vw = video?.videoWidth ?? 0
+  const vh = video?.videoHeight ?? 0
+  const vRect = video?.getBoundingClientRect()
+  const rect = vRect && vRect.width > 0 && vRect.height > 0 ? vRect : fallbackRect
+  if (!rect) {
+    return null
+  }
+
+  if (vw > 0 && vh > 0) {
+    const scale = Math.min(rect.width / vw, rect.height / vh)
+    const displayedWidth = vw * scale
+    const displayedHeight = vh * scale
+    const offsetX = (rect.width - displayedWidth) / 2
+    const offsetY = (rect.height - displayedHeight) / 2
+    const x = (event.clientX - rect.left - offsetX) / displayedWidth
+    const y = (event.clientY - rect.top - offsetY) / displayedHeight
+    return { x: clamp(x), y: clamp(y) }
+  }
+
+  return {
+    x: clamp((event.clientX - rect.left) / rect.width),
+    y: clamp((event.clientY - rect.top) / rect.height),
+  }
+}
+
+function quadToPolygonValue(points: Point[]) {
+  return points.map((point) => `${point.x * 100},${point.y * 100}`).join(' ')
+}
+
+function fieldQuadsEqual(a: FieldQuad | null | undefined, b: FieldQuad | null): boolean {
+  if (!a || !b) {
+    return false
+  }
+  const eps = 1e-8
+  return a.every(
+    (point, index) =>
+      Math.abs(point.x - b[index].x) < eps && Math.abs(point.y - b[index].y) < eps,
+  )
+}
+
+/** CSS px; field map uses one marker size (third tuple value in JSON is legacy). */
+const FIELD_MAP_FUEL_DOT_RADIUS_PX = 6
+
+function drawFieldMapFrame(canvas: HTMLCanvasElement, fieldMapData: FieldMapData, frameIndex: number) {
+  const rect = canvas.getBoundingClientRect()
+  if (!rect.width || !rect.height) {
+    return
+  }
+
+  const context = canvas.getContext('2d')
+  if (!context) {
+    return
+  }
+
+  const devicePixelRatio = window.devicePixelRatio || 1
+  const width = Math.round(rect.width * devicePixelRatio)
+  const height = Math.round(rect.height * devicePixelRatio)
+
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width
+    canvas.height = height
+  }
+
+  context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0)
+  context.clearRect(0, 0, rect.width, rect.height)
+
+  const maxFrameIndex = Math.max(fieldMapData.frames.length - 1, 0)
+  const activeFrame = fieldMapData.frames[Math.min(frameIndex, maxFrameIndex)] ?? []
+
+  const r = FIELD_MAP_FUEL_DOT_RADIUS_PX
+  for (const [normalizedX, normalizedY] of activeFrame) {
+    const x = (normalizedX / 10000) * rect.width
+    const y = (normalizedY / 10000) * rect.height
+
+    context.beginPath()
+    context.arc(x, y, r, 0, Math.PI * 2)
+    context.fillStyle = 'rgba(245, 212, 62, 0.92)'
+    context.shadowColor = 'rgba(245, 212, 62, 0.42)'
+    context.shadowBlur = r * 1.8
+    context.fill()
+  }
+
+  context.shadowBlur = 0
+}
+
 function App() {
   const viewerState = readInitialViewerState()
   const [sessions, setSessions] = useState<Session[]>([])
@@ -128,23 +252,35 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [isImporting, setIsImporting] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
-  const [draftBox, setDraftBox] = useState<BBox | null>(null)
-  const [isDrawing, setIsDrawing] = useState(false)
+  const [draftFieldPoints, setDraftFieldPoints] = useState<Point[]>([])
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
   const [isScrubbing, setIsScrubbing] = useState(false)
   const [overlayFrameIndex, setOverlayFrameIndex] = useState(0)
   const [isDeleting, setIsDeleting] = useState(false)
+  const [isFieldQuadSaving, setIsFieldQuadSaving] = useState(false)
+  const [fieldMapData, setFieldMapData] = useState<FieldMapData | null>(null)
+  const [isFieldMapLoading, setIsFieldMapLoading] = useState(false)
   const stageRef = useRef<HTMLDivElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
-  const pointerOriginRef = useRef<{ x: number; y: number } | null>(null)
+  const fieldCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const playbackFrameRef = useRef<number | null>(null)
 
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null
-  const activeBox = draftBox ?? selectedSession?.bbox ?? null
-  const activePixelBox = boxToPixels(activeBox, selectedSession)
+  const orderedDraftQuad =
+    draftFieldPoints.length === 4 ? orderQuadPoints(draftFieldPoints) : null
+  const hasUnsavedFieldQuad =
+    draftFieldPoints.length === 4 &&
+    orderedDraftQuad != null &&
+    !fieldQuadsEqual(selectedSession?.fieldQuad, orderedDraftQuad)
+  const activeFieldPoints = draftFieldPoints.length > 0 ? draftFieldPoints : selectedSession?.fieldQuad ?? []
+  const activeCornerCount =
+    draftFieldPoints.length > 0 && draftFieldPoints.length < 4 ? draftFieldPoints.length : selectedSession?.fieldQuad?.length ?? 0
+  const hasIncompleteFieldSelection = draftFieldPoints.length > 0 && draftFieldPoints.length < 4
+  const activePixelBox = hasIncompleteFieldSelection ? null : boxToPixels(selectedSession?.bbox ?? null, selectedSession)
   const overlayFrameUrl = buildOverlayFrameUrl(selectedSession?.media.overlayFrameUrlTemplate ?? null, overlayFrameIndex)
+  const isFieldMode = mode === 'field'
 
   useEffect(() => {
     void (async () => {
@@ -193,12 +329,25 @@ function App() {
   }, [mode, overlayOpacity])
 
   useEffect(() => {
-    setDraftBox(selectedSession?.bbox ?? null)
+    setDraftFieldPoints(selectedSession?.fieldQuad ? [...selectedSession.fieldQuad] : [])
     setCurrentTime(0)
     setDuration(selectedSession?.video.duration ?? 0)
     setIsPlaying(false)
     setOverlayFrameIndex(0)
-  }, [selectedSession?.id, selectedSession?.bbox, selectedSession?.video.duration])
+  }, [selectedSession?.id])
+
+  useEffect(() => {
+    if (!selectedSession) {
+      return
+    }
+    setDraftFieldPoints(selectedSession.fieldQuad ? [...selectedSession.fieldQuad] : [])
+  }, [selectedSession?.id, selectedSession?.fieldQuad])
+
+  useEffect(() => {
+    if (selectedSession?.video.duration != null) {
+      setDuration(selectedSession.video.duration)
+    }
+  }, [selectedSession?.video.duration])
 
   useEffect(() => {
     return () => {
@@ -207,6 +356,70 @@ function App() {
       }
     }
   }, [])
+
+  useEffect(() => {
+    const fieldMapDataUrl = selectedSession?.media.fieldMapDataUrl
+    setFieldMapData(null)
+
+    if (!fieldMapDataUrl) {
+      setIsFieldMapLoading(false)
+      return
+    }
+
+    let isActive = true
+
+    void (async () => {
+      try {
+        setIsFieldMapLoading(true)
+        const loadedFieldMapData = await api.getFieldMapData(fieldMapDataUrl)
+        if (isActive) {
+          setFieldMapData(loadedFieldMapData)
+        }
+      } catch (error) {
+        if (isActive) {
+          setErrorMessage(error instanceof Error ? error.message : 'Unable to load the field map data.')
+        }
+      } finally {
+        if (isActive) {
+          setIsFieldMapLoading(false)
+        }
+      }
+    })()
+
+    return () => {
+      isActive = false
+    }
+  }, [selectedSession?.id, selectedSession?.media.fieldMapDataUrl, selectedSession?.updatedAt])
+
+  useEffect(() => {
+    if (!isFieldMode || !fieldMapData || !selectedSession?.overlay) {
+      return
+    }
+    const video = videoRef.current
+    if (!video) {
+      return
+    }
+    const fps = selectedSession.overlay.stats.overlayFps || 30
+    const frameCount = selectedSession.overlay.stats.overlayFrameCount || 0
+    const nextFrame = Math.max(0, Math.min(frameCount - 1, Math.floor(video.currentTime * fps)))
+    setOverlayFrameIndex(nextFrame)
+  }, [isFieldMode, fieldMapData, selectedSession?.overlay])
+
+  useEffect(() => {
+    if (!isFieldMode || !fieldMapData || !fieldCanvasRef.current) {
+      return
+    }
+
+    const canvas = fieldCanvasRef.current
+    const render = () => drawFieldMapFrame(canvas, fieldMapData, overlayFrameIndex)
+    render()
+
+    const resizeObserver = new ResizeObserver(render)
+    resizeObserver.observe(canvas)
+    return () => {
+      resizeObserver.disconnect()
+    }
+  }, [fieldMapData, isFieldMode, overlayFrameIndex])
 
   function upsertSession(nextSession: Session) {
     setSessions((current) => {
@@ -255,30 +468,28 @@ function App() {
     }
   }
 
-  function readPointFromEvent(event: React.PointerEvent<HTMLDivElement>) {
-    const rect = stageRef.current?.getBoundingClientRect()
-    if (!rect) {
-      return null
-    }
-
-    return {
-      x: clamp((event.clientX - rect.left) / rect.width),
-      y: clamp((event.clientY - rect.top) / rect.height),
-    }
-  }
-
-  async function saveBox(box: BBox | null) {
-    if (!selectedSession) {
-      return
+  async function saveFieldQuad(fieldQuad: FieldQuad | null, sessionIdOverride?: string): Promise<boolean> {
+    const sessionId = sessionIdOverride ?? selectedSession?.id
+    if (!sessionId) {
+      setErrorMessage('No session selected.')
+      return false
     }
 
     try {
+      setIsFieldQuadSaving(true)
       setErrorMessage(null)
-      const updated = await api.saveBBox(selectedSession.id, box)
-      setDraftBox(updated.bbox)
-      upsertSession(updated)
+      setDraftFieldPoints(fieldQuad ? [...fieldQuad] : [])
+      await api.saveFieldQuad(sessionId, fieldQuad)
+      const fresh = await api.getSession(sessionId)
+      setDraftFieldPoints(fresh.fieldQuad ? [...fresh.fieldQuad] : [])
+      upsertSession(fresh)
+      return true
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : 'Unable to save the bounding box.')
+      setDraftFieldPoints(fieldQuad ? [...fieldQuad] : [])
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to save the field borders.')
+      return false
+    } finally {
+      setIsFieldQuadSaving(false)
     }
   }
 
@@ -312,9 +523,18 @@ function App() {
     try {
       setIsProcessing(true)
       setErrorMessage(null)
+      if (draftFieldPoints.length === 4) {
+        const ordered = orderQuadPoints(draftFieldPoints)
+        if (ordered && !fieldQuadsEqual(selectedSession.fieldQuad, ordered)) {
+          const saved = await saveFieldQuad(ordered, selectedSession.id)
+          if (!saved) {
+            return
+          }
+        }
+      }
       const processed = await api.processSession(selectedSession.id)
       upsertSession(processed)
-      setMode('blend')
+      setMode((currentMode) => (currentMode === 'field' ? 'field' : 'blend'))
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : 'Unable to generate the overlay.')
     } finally {
@@ -339,63 +559,34 @@ function App() {
     }
   }
 
-  function handleStagePointerDown(event: React.PointerEvent<HTMLDivElement>) {
-    if (!selectedSession?.media.videoUrl) {
-      return
-    }
-
-    const point = readPointFromEvent(event)
-    if (!point) {
-      return
-    }
-
-    pointerOriginRef.current = point
-    setIsDrawing(true)
-    setDraftBox({
-      x: point.x,
-      y: point.y,
-      width: 0,
-      height: 0,
-    })
-    event.currentTarget.setPointerCapture(event.pointerId)
-  }
-
-  function handleStagePointerMove(event: React.PointerEvent<HTMLDivElement>) {
-    if (!isDrawing || !pointerOriginRef.current) {
-      return
-    }
-
-    const point = readPointFromEvent(event)
-    if (!point) {
-      return
-    }
-
-    setDraftBox(makeBox(pointerOriginRef.current, point))
-  }
-
   function handleStagePointerUp(event: React.PointerEvent<HTMLDivElement>) {
-    if (!isDrawing || !pointerOriginRef.current) {
+    if (isFieldMode || !selectedSession?.media.videoUrl) {
       return
     }
 
-    const point = readPointFromEvent(event)
-    const start = pointerOriginRef.current
-    setIsDrawing(false)
-    pointerOriginRef.current = null
-    event.currentTarget.releasePointerCapture(event.pointerId)
-
+    const point = readPointFromPointerEvent(event, videoRef.current, stageRef.current?.getBoundingClientRect() ?? null)
     if (!point) {
       return
     }
 
-    const nextBox = makeBox(start, point)
-    if (nextBox.width < 0.01 || nextBox.height < 0.01) {
-      setDraftBox(selectedSession?.bbox ?? null)
-      return
-    }
+    setErrorMessage(null)
+    setDraftFieldPoints((current) => {
+      const basePoints = current.length === 4 ? [] : current
+      const nextPoints = [...basePoints, point]
 
-    setDraftBox(nextBox)
-    void saveBox(nextBox)
+      if (nextPoints.length < 4) {
+        return nextPoints
+      }
+
+      const ordered = orderQuadPoints(nextPoints)
+      if (!ordered) {
+        setErrorMessage('Pick four distinct field corners.')
+        return []
+      }
+
+      void saveFieldQuad(ordered)
+      return [...ordered]
+    })
   }
 
   function togglePlayback() {
@@ -580,14 +771,20 @@ function App() {
               {selectedSession ? (
                 <div className="toolbar">
                   <div className="segmented-control">
-                    {(['video', 'overlay', 'blend'] as DisplayMode[]).map((value) => (
+                    {(['video', 'overlay', 'blend', 'field'] as DisplayMode[]).map((value) => (
                       <button
                         key={value}
                         className={mode === value ? 'segment-active' : ''}
                         onClick={() => setMode(value)}
                         type="button"
                       >
-                        {value === 'video' ? 'Video only' : value === 'overlay' ? 'Overlay only' : 'Overlay on video'}
+                        {value === 'video'
+                          ? 'Video only'
+                          : value === 'overlay'
+                            ? 'Overlay only'
+                            : value === 'blend'
+                              ? 'Overlay on video'
+                              : 'Field map'}
                       </button>
                     ))}
                   </div>
@@ -596,7 +793,14 @@ function App() {
                     className="primary-button"
                     onClick={() => void handleProcess()}
                     type="button"
-                    disabled={!selectedSession.bbox || isProcessing || selectedSession.status === 'downloading'}
+                    disabled={
+                      hasIncompleteFieldSelection ||
+                      hasUnsavedFieldQuad ||
+                      (!selectedSession.fieldQuad && !selectedSession.bbox) ||
+                      isProcessing ||
+                      isFieldQuadSaving ||
+                      selectedSession.status === 'downloading'
+                    }
                   >
                     {isProcessing || selectedSession.status === 'processing' ? 'Running...' : 'Run script'}
                   </button>
@@ -608,21 +812,20 @@ function App() {
               <>
                 <div className="stage">
                   <div
-                    className="stage-media"
+                    className={`stage-media ${isFieldMode ? 'field-stage' : ''}`}
                     ref={stageRef}
-                    onPointerDown={handleStagePointerDown}
-                    onPointerMove={handleStagePointerMove}
                     onPointerUp={handleStagePointerUp}
                     style={{
-                      aspectRatio:
-                        selectedSession.video.width && selectedSession.video.height
+                      aspectRatio: isFieldMode
+                        ? '3901 / 1583'
+                        : selectedSession.video.width && selectedSession.video.height
                           ? `${selectedSession.video.width} / ${selectedSession.video.height}`
                           : '16 / 9',
                     }}
                   >
                     <video
                       key={selectedSession.id}
-                      className="stage-video"
+                      className={`stage-video ${isFieldMode ? 'stage-video-hidden' : ''}`}
                       ref={videoRef}
                       src={selectedSession.media.videoUrl ?? undefined}
                       preload="metadata"
@@ -639,45 +842,90 @@ function App() {
                       }}
                     />
 
-                    {overlayFrameUrl ? (
-                      <img
-                        alt="Fuel density overlay frame"
-                        className="stage-overlay"
-                        src={overlayFrameUrl}
-                        style={{
-                          opacity: mode === 'video' ? 0 : mode === 'overlay' ? 1 : overlayOpacity,
-                        }}
-                      />
-                    ) : selectedSession.media.overlayTransparentUrl ? (
-                      <img
-                        alt="Fuel density overlay"
-                        className="stage-overlay"
-                        src={selectedSession.media.overlayTransparentUrl}
-                        style={{
-                          opacity: mode === 'video' ? 0 : mode === 'overlay' ? 1 : overlayOpacity,
-                        }}
-                      />
-                    ) : null}
+                    {isFieldMode ? (
+                      <>
+                      <img alt="Top-down FRC Rebuilt field" className="stage-field-base" src={FIELD_ASSET_URL} />
+                      <canvas className="stage-field-overlay" ref={fieldCanvasRef} />
 
-                    <div className="stage-drawing-layer" />
+                      {!fieldMapData && !isFieldMapLoading ? (
+                        <div className="stage-empty-overlay">
+                          <p>Run the script to generate projected fuel positions.</p>
+                        </div>
+                      ) : null}
 
-                    {activeBox ? (
-                      <div
-                        className={`selection-box ${isDrawing ? 'selection-box-live' : ''}`}
-                        style={{
-                          left: `${activeBox.x * 100}%`,
-                          top: `${activeBox.y * 100}%`,
-                          width: `${activeBox.width * 100}%`,
-                          height: `${activeBox.height * 100}%`,
-                        }}
-                      />
-                    ) : null}
+                      {isFieldMapLoading ? (
+                        <div className="stage-empty-overlay">
+                          <p>Loading field map...</p>
+                        </div>
+                      ) : null}
+                      </>
+                    ) : (
+                      <>
+                      {overlayFrameUrl ? (
+                        <img
+                          alt="Fuel density overlay frame"
+                          className="stage-overlay"
+                          src={cacheBustUrl(overlayFrameUrl, selectedSession.updatedAt)}
+                          style={{
+                            opacity: mode === 'video' ? 0 : mode === 'overlay' ? 1 : overlayOpacity,
+                          }}
+                        />
+                      ) : selectedSession.media.overlayTransparentUrl ? (
+                        <img
+                          alt="Fuel density overlay"
+                          className="stage-overlay"
+                          src={cacheBustUrl(
+                            selectedSession.media.overlayTransparentUrl,
+                            selectedSession.updatedAt,
+                          )}
+                          style={{
+                            opacity: mode === 'video' ? 0 : mode === 'overlay' ? 1 : overlayOpacity,
+                          }}
+                        />
+                      ) : null}
 
-                    {!selectedSession.media.videoUrl ? (
-                      <div className="stage-empty-overlay">
-                        <p>Import a video to begin.</p>
-                      </div>
-                    ) : null}
+                      <div className="stage-drawing-layer" />
+
+                      {activeFieldPoints.length > 0 ? (
+                        <div className="field-selection-overlay">
+                          {activeFieldPoints.length >= 2 ? (
+                            <svg className="field-selection-shape" viewBox="0 0 100 100" preserveAspectRatio="none">
+                              {activeFieldPoints.length >= 3 ? (
+                                <polygon
+                                  className={`field-selection-polygon ${activeFieldPoints.length === 4 ? 'field-selection-complete' : ''}`}
+                                  points={quadToPolygonValue(activeFieldPoints)}
+                                />
+                              ) : (
+                                <polyline
+                                  className="field-selection-polygon"
+                                  points={quadToPolygonValue(activeFieldPoints)}
+                                />
+                              )}
+                            </svg>
+                          ) : null}
+
+                          {activeFieldPoints.map((point, index) => (
+                            <div
+                              key={`${point.x}-${point.y}-${index}`}
+                              className={`field-selection-point ${activeFieldPoints.length === 4 ? 'field-selection-point-complete' : ''}`}
+                              style={{
+                                left: `${point.x * 100}%`,
+                                top: `${point.y * 100}%`,
+                              }}
+                            >
+                              <span>{index + 1}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {!selectedSession.media.videoUrl ? (
+                        <div className="stage-empty-overlay">
+                          <p>Import a video to begin.</p>
+                        </div>
+                      ) : null}
+                      </>
+                    )}
                   </div>
                 </div>
 
@@ -714,16 +962,44 @@ function App() {
                       step={0.05}
                       value={overlayOpacity}
                       onChange={(event) => setOverlayOpacity(Number(event.target.value))}
-                      disabled={!selectedSession.media.overlayTransparentUrl && !selectedSession.media.overlayFrameUrlTemplate}
+                      disabled={
+                        isFieldMode ||
+                        (!selectedSession.media.overlayTransparentUrl && !selectedSession.media.overlayFrameUrlTemplate)
+                      }
                     />
                   </div>
                 </div>
 
                 <div className="helper-row">
-                  <p>Drag directly over the frame to redraw the analysis region.</p>
-                  <button className="ghost-button" onClick={() => void saveBox(null)} type="button">
-                    Clear box
-                  </button>
+                  <p>
+                    {isFieldMode
+                      ? 'Field map mode follows the current timeline frame. Switch back to the video to redefine the field borders.'
+                      : activeFieldPoints.length > 0 && activeFieldPoints.length < 4
+                        ? `Click ${4 - activeFieldPoints.length} more field corner${4 - activeFieldPoints.length === 1 ? '' : 's'} to finish the selection.`
+                        : 'Click the four field corners on the video. The same Run script action updates both the overlay and the field map.'}
+                  </p>
+                  <div className="helper-actions">
+                    <button
+                      className="ghost-button"
+                      onClick={() => {
+                        setDraftFieldPoints((current) => (current.length > 0 && current.length < 4 ? current.slice(0, -1) : current))
+                      }}
+                      type="button"
+                      disabled={activeFieldPoints.length === 0 || activeFieldPoints.length === 4}
+                    >
+                      Undo point
+                    </button>
+                    <button
+                      className="ghost-button"
+                      onClick={() => {
+                        setDraftFieldPoints([])
+                        void saveFieldQuad(null)
+                      }}
+                      type="button"
+                    >
+                      Clear field
+                    </button>
+                  </div>
                 </div>
               </>
             ) : (
@@ -764,10 +1040,14 @@ function App() {
             </section>
 
             <section className="panel meta-panel">
-              <p className="eyebrow">Bounding box</p>
-              <h2>Analysis region</h2>
+              <p className="eyebrow">Field Selection</p>
+              <h2>Projected borders</h2>
               {activePixelBox ? (
                 <div className="stats-grid compact">
+                  <div>
+                    <span>Corners</span>
+                    <strong>{activeCornerCount} / 4</strong>
+                  </div>
                   <div>
                     <span>X</span>
                     <strong>{activePixelBox.x}px</strong>
@@ -786,7 +1066,7 @@ function App() {
                   </div>
                 </div>
               ) : (
-                <p className="muted-copy">Draw a box on the viewer to limit where the overlay accumulates.</p>
+                <p className="muted-copy">Click the four field corners in the video to define the projection and overlay crop.</p>
               )}
             </section>
 

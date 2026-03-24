@@ -7,6 +7,13 @@ export type BBox = {
   height: number
 }
 
+export type Point = {
+  x: number
+  y: number
+}
+
+export type FieldQuad = [Point, Point, Point, Point]
+
 export type OverlayStats = {
   bbox: {
     x: number
@@ -22,6 +29,16 @@ export type OverlayStats = {
   overlayFrameCount: number
 }
 
+export type FieldMapPoint = [number, number, number]
+
+export type FieldMapData = {
+  imageWidth: number
+  imageHeight: number
+  fps: number
+  frameCount: number
+  frames: FieldMapPoint[][]
+}
+
 export type Session = {
   id: string
   title: string
@@ -31,6 +48,7 @@ export type Session = {
   updatedAt: string
   status: SessionStatus
   bbox: BBox | null
+  fieldQuad: FieldQuad | null
   video: {
     fileName: string | null
     width: number | null
@@ -42,6 +60,7 @@ export type Session = {
     transparentFileName: string
     framesDirName: string | null
     rawDataFileName: string
+    fieldMapDataFileName: string | null
     stats: OverlayStats
   } | null
   media: {
@@ -49,8 +68,9 @@ export type Session = {
     overlayUrl: string | null
     overlayTransparentUrl: string | null
     overlayFrameUrlTemplate: string | null
+    fieldMapDataUrl: string | null
   }
   lastError: string | null
 }
 
-export type DisplayMode = 'video' | 'overlay' | 'blend'
+export type DisplayMode = 'video' | 'overlay' | 'blend' | 'field'

@@ -1,4 +1,4 @@
-import type { BBox, Session } from './types'
+import type { BBox, FieldMapData, FieldQuad, Session } from './types'
 
 async function request<T>(input: string, init?: RequestInit) {
   const response = await fetch(input, {
@@ -18,6 +18,9 @@ async function request<T>(input: string, init?: RequestInit) {
 }
 
 export const api = {
+  getSession(sessionId: string) {
+    return request<Session>(`/api/sessions/${sessionId}`)
+  },
   listSessions() {
     return request<Session[]>('/api/sessions')
   },
@@ -31,6 +34,12 @@ export const api = {
     return request<Session>(`/api/sessions/${sessionId}/bbox`, {
       method: 'POST',
       body: JSON.stringify({ bbox }),
+    })
+  },
+  saveFieldQuad(sessionId: string, fieldQuad: FieldQuad | null) {
+    return request<Session>(`/api/sessions/${sessionId}/field-quad`, {
+      method: 'POST',
+      body: JSON.stringify({ fieldQuad }),
     })
   },
   updateVideoMetadata(sessionId: string, width: number, height: number, duration: number) {
@@ -49,5 +58,8 @@ export const api = {
     return request<{ ok: boolean }>(`/api/sessions/${sessionId}`, {
       method: 'DELETE',
     })
+  },
+  getFieldMapData(url: string) {
+    return request<FieldMapData>(url, { cache: 'no-store' })
   },
 }

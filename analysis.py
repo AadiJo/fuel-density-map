@@ -1,6 +1,21 @@
 import cv2
 import numpy as np
 
+
+def yellow_pixel_mask(frame):
+    return (
+        (frame[:, :, 2] > 200) &
+        (frame[:, :, 1] > 200) &
+        (frame[:, :, 0] < 100)
+    )
+
+
+def yellow_pixel_mask_hsv(frame_bgr):
+    """HSV-based yellow detection — tolerant of shadows and compression."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, np.array([15, 70, 110]), np.array([45, 255, 255]))
+
+
 def clamp_bbox(bbox, frame_width, frame_height):
     if bbox is None:
         return None
@@ -59,18 +74,10 @@ def get_total_yellow_pixels_from_video(vid_path, start_time=0, end_time=None, bb
 def analyze_frame(frame, bbox=None):
     # OpenCV frames are BGR. Match the original RGB thresholds without converting.
     if bbox is None:
-        return (
-            (frame[:, :, 2] > 200) &
-            (frame[:, :, 1] > 200) &
-            (frame[:, :, 0] < 100)
-        ).astype(np.uint32)
+        return yellow_pixel_mask(frame).astype(np.uint32)
 
     x, y, width, height = bbox
     mask = np.zeros(frame.shape[:2], dtype=np.uint32)
     frame_slice = frame[y : y + height, x : x + width]
-    mask[y : y + height, x : x + width] = (
-        (frame_slice[:, :, 2] > 200) &
-        (frame_slice[:, :, 1] > 200) &
-        (frame_slice[:, :, 0] < 100)
-    ).astype(np.uint32)
+    mask[y : y + height, x : x + width] = yellow_pixel_mask(frame_slice).astype(np.uint32)
     return mask
