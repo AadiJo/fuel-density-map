@@ -1,5 +1,6 @@
 import os
 import analysis
+import numpy as np
 from PIL import Image
 
 def raw_data_analysis():
@@ -18,7 +19,7 @@ def raw_data_analysis():
     raw_data_file_name = vid_path.split("/")[-1].split(".")[0] + "_raw_data.txt"
     with open(os.path.join(output_dir, raw_data_file_name), "w") as f:
         for row in vid_totals:
-            f.write(" ".join(str(x) for x in row) + "\n")
+            f.write(" ".join(str(int(x)) for x in row) + "\n")
     print("Results saved.")
 
 def process_raw_data():
@@ -29,15 +30,15 @@ def process_raw_data():
 
     print("Processing raw data...")
     # Read the raw data from the file
-    with open(data_path, "r") as f:
-        raw_data = [list(map(int, line.split())) for line in f]
+    raw_data = np.loadtxt(data_path, dtype=np.int32)
     
     processed_folder_name = data_path.split("/")[-1].split("_")[0] + "_processed"
     processed_folder_path = os.path.join(processed_image_path, processed_folder_name)
     os.makedirs(processed_folder_path, exist_ok=True)
 
-    max_value = max(max(row) for row in raw_data)
-    actual_average = sum(x for row in raw_data for x in row if x > 0) / sum(1 for row in raw_data for x in row if x > 0)
+    max_value = int(raw_data.max())
+    non_zero_values = raw_data[raw_data > 0]
+    actual_average = float(non_zero_values.mean()) if non_zero_values.size else 0.0
     average_of_non_zero_values = actual_average + pct_from_average_to_max * (max_value - actual_average)
     print(f"Max value: {max_value}")
     print(f"Actual average of non-zero values: {actual_average}")
@@ -50,46 +51,50 @@ def process_raw_data():
     # and values between 0 and average_of_non_zero_values being a gradient from black to average_display_color,
     # and values between average_of_non_zero_values and max_value being a gradient from average_display_color to white
 
-    color_array = []
-    for row in raw_data:
-        color_row = [get_color(value, max_value, average_of_non_zero_values, average_display_color) for value in row]
-        color_array.append(color_row)
+    color_array = create_color_array(raw_data, max_value, average_of_non_zero_values, average_display_color)
 
     print("Creating image...")
-    # Save the color array as an image
-    img = Image.new("RGB", (len(color_array[0]), len(color_array)))
-    for i in range(len(color_array)):
-        for j in range(len(color_array[i])):
-            img.putpixel((j, i), color_array[i][j])
+    img = Image.fromarray(color_array, mode="RGB")
     img.save(os.path.join(processed_folder_path, "processed_image.png"))
     print("Image saved.")
 
     print("Creating transparent image...")
-    # also create a version where black is transparent and and everything else is half transparent
-    img = Image.new("RGBA", (len(color_array[0]), len(color_array)))
-    for i in range(len(color_array)):
-        for j in range(len(color_array[i])):
-            if color_array[i][j] == (0, 0, 0):
-                img.putpixel((j, i), (0, 0, 0, 0)) # transparent
-            else:
-                img.putpixel((j, i), color_array[i][j] + (128,)) # half transparent
+    alpha_channel = np.where(np.any(color_array != 0, axis=2), 128, 0).astype(np.uint8)
+    transparent_image = np.dstack((color_array, alpha_channel))
+    img = Image.fromarray(transparent_image, mode="RGBA")
     img.save(os.path.join(processed_folder_path, "processed_image_transparent.png"))
     print("Transparent image saved.")
 
-def get_color(value, max_value, average_of_non_zero_values, average_display_color):
-        if value == 0:
-            return (0, 0, 0) # black
-        elif value >= max_value:
-            return (255, 255, 255) # white
-        elif value <= average_of_non_zero_values:
-            # gradient from black to average_display_color
-            ratio = value / average_of_non_zero_values
-            return tuple(int(ratio * average_display_color[i]) for i in range(3))
+def create_color_array(raw_data, max_value, average_of_non_zero_values, average_display_color):
+    color_array = np.zeros((*raw_data.shape, 3), dtype=np.uint8)
+
+    if max_value <= 0:
+        return color_array
+
+    average_color = np.array(average_display_color, dtype=np.float32)
+    non_zero_mask = raw_data > 0
+
+    if average_of_non_zero_values > 0:
+        lower_mask = non_zero_mask & (raw_data <= average_of_non_zero_values)
+        if np.any(lower_mask):
+            lower_ratio = (raw_data[lower_mask] / average_of_non_zero_values).astype(np.float32)
+            color_array[lower_mask] = np.clip(lower_ratio[:, None] * average_color, 0, 255).astype(np.uint8)
+
+    upper_mask = non_zero_mask & (raw_data > average_of_non_zero_values)
+    upper_range = max_value - average_of_non_zero_values
+    if np.any(upper_mask):
+        if upper_range <= 0:
+            color_array[upper_mask] = 255
         else:
-            # gradient from average_display_color to white
-            ratio = (value - average_of_non_zero_values) / (max_value - average_of_non_zero_values)
-            return tuple(int(average_display_color[i] + ratio * (255 - average_display_color[i])) for i in range(3))
-        
+            upper_ratio = ((raw_data[upper_mask] - average_of_non_zero_values) / upper_range).astype(np.float32)
+            color_array[upper_mask] = np.clip(
+                average_color + upper_ratio[:, None] * (255 - average_color),
+                0,
+                255,
+            ).astype(np.uint8)
+
+    color_array[raw_data >= max_value] = 255
+    return color_array
 
 
 if __name__ == "__main__":
