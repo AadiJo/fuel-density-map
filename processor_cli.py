@@ -127,6 +127,8 @@ def quad_mask(bbox, field_quad):
 
 
 _MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+# Fills lighting holes inside large yellow piles so the mask is one blob (not a thin ring).
+_MORPH_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
 def precompute_roi_quad_mask(bbox, field_quad):
@@ -136,18 +138,45 @@ def precompute_roi_quad_mask(bbox, field_quad):
     return quad_mask(bbox, field_quad)
 
 
-def roi_yellow_mask_binary(frame, bbox, field_quad, quad_mask_roi=None):
-    """HSV yellow mask cropped to the ROI and field quad, with light noise removal."""
+def roi_yellow_mask_binary(
+    frame,
+    bbox,
+    field_quad,
+    quad_mask_roi=None,
+    prev_gray_roi=None,
+    use_motion_gate=True,
+    motion_threshold=None,
+    use_fast_mask=False,
+):
+    """
+    Unified fuel mask on the ROI, optional quad clip, morph open+close, optional motion gate.
+    Returns (mask_uint8_or_none, gray_roi_for_next_frame).
+    """
+    if motion_threshold is None:
+        motion_threshold = analysis.MOTION_DIFF_THRESHOLD
     x, y, width, height = bbox
     frame_slice = frame[y : y + height, x : x + width]
     if frame_slice.size == 0:
-        return None
-    mask = analysis.yellow_pixel_mask_hsv(frame_slice)
+        return None, None
+    gray_roi = cv2.cvtColor(frame_slice, cv2.COLOR_BGR2GRAY)
+    if use_fast_mask:
+        mask = analysis.fuel_mask_bgr_fast(frame_slice)
+    else:
+        mask = analysis.fuel_mask_bgr(frame_slice)
     if field_quad is not None:
         qm = quad_mask_roi if quad_mask_roi is not None else quad_mask(bbox, field_quad)
         mask = cv2.bitwise_and(mask, qm)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _MORPH_KERNEL_OPEN)
-    return mask
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _MORPH_KERNEL_CLOSE)
+    if (
+        use_motion_gate
+        and prev_gray_roi is not None
+        and prev_gray_roi.shape == gray_roi.shape
+    ):
+        diff = cv2.absdiff(gray_roi, prev_gray_roi)
+        static = (diff < motion_threshold).astype(np.uint8) * 255
+        mask = cv2.bitwise_and(mask, static)
+    return mask, gray_roi
 
 
 def _dt_peaks_in_component(component_mask, budget, min_sep):
@@ -176,7 +205,40 @@ def _dt_peaks_in_component(component_mask, budget, min_sep):
     return peaks
 
 
-def ball_centers_from_mask(mask_binary, max_centers=500, **_kwargs):
+def _component_circularity(component_mask_uint8):
+    contours, _ = cv2.findContours(component_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 1.0
+    c = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    if area < 1.0:
+        return 1.0
+    perim = cv2.arcLength(c, True)
+    if perim < 1e-3:
+        return 0.0
+    return float((4.0 * np.pi * area) / (perim * perim))
+
+
+def _component_passes_shape_filter(area, single_ball_area, component_mask_uint8):
+    """
+    Reject tiny slivers and very large *elongated* regions (people/robots).
+    Large *compact* clumps must pass — a previous max-area cap dropped whole piles.
+    """
+    if area < 5:
+        return True
+    circ = _component_circularity(component_mask_uint8)
+    # Huge elongated blob (likely not a fuel pile)
+    if area > max(180.0 * single_ball_area, 9000.0) and circ < 0.18:
+        return False
+    # Catastrophically wrong mask (whole frame glitches)
+    if area > 250_000:
+        return False
+    if area >= 14 and circ < 0.22:
+        return False
+    return True
+
+
+def ball_centers_from_mask(mask_binary, max_centers=500, shape_filter=True, **_kwargs):
     """
     Area-calibrated ball detection.
 
@@ -184,6 +246,8 @@ def ball_centers_from_mask(mask_binary, max_centers=500, **_kwargs):
     how many balls each larger blob contains by dividing its area.  Distance-
     transform peaks place centers inside large blobs; any shortfall is filled by
     uniform sampling along the blob's pixels.
+
+    Optional shape filtering drops elongated or oversized blobs (e.g. clothing).
     """
     mask_work = (mask_binary > 0).astype(np.uint8) * 255
     if not np.any(mask_work):
@@ -208,6 +272,10 @@ def ball_centers_from_mask(mask_binary, max_centers=500, **_kwargs):
             break
 
         area = stats[i, cv2.CC_STAT_AREA]
+        component_mask = (labels == i).astype(np.uint8) * 255
+        if shape_filter and not _component_passes_shape_filter(area, single_ball_area, component_mask):
+            continue
+
         cx, cy = centroids[i]
         estimated_balls = max(1, round(area / single_ball_area))
 
@@ -215,7 +283,6 @@ def ball_centers_from_mask(mask_binary, max_centers=500, **_kwargs):
             centers.append((int(cx), int(cy)))
             continue
 
-        component_mask = (labels == i).astype(np.uint8) * 255
         peaks = _dt_peaks_in_component(component_mask, estimated_balls, min_sep)
 
         if peaks:
@@ -265,7 +332,7 @@ def create_live_overlay_frame(frame, bbox, field_quad, overlay_color):
     (not dilate+blur — that merged entire clusters into one pink smear).
     """
     h, w = frame.shape[:2]
-    mask = roi_yellow_mask_binary(frame, bbox, field_quad)
+    mask, _ = roi_yellow_mask_binary(frame, bbox, field_quad)
     if mask is None or not np.any(mask):
         return np.zeros((h, w, 3), dtype=np.uint8)
     centers = ball_centers_from_mask(mask)
@@ -299,7 +366,7 @@ def project_fuel_points_from_centers(centers, bbox, projection_matrix, field_wid
 
 
 def project_fuel_points(frame, bbox, field_quad, projection_matrix, field_width, field_height):
-    mask = roi_yellow_mask_binary(frame, bbox, field_quad)
+    mask, _ = roi_yellow_mask_binary(frame, bbox, field_quad)
     if mask is None or not np.any(mask):
         return []
     peaks = ball_centers_from_mask(mask)
@@ -317,6 +384,8 @@ def write_dynamic_assets(
     progress_callback=None,
     progress_total_frames=None,
     progress_offset=0,
+    use_motion_gate=True,
+    use_fast_mask=False,
 ):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -353,6 +422,7 @@ def write_dynamic_assets(
     roi_quad_mask = precompute_roi_quad_mask(bbox, field_quad)
     stride = max(1, int(OVERLAY_FRAME_STRIDE))
     export_fps = float(fps) / float(stride)
+    prev_gray_roi = None
 
     if progress_callback and progress_total_frames is not None:
         progress_callback(progress_offset, progress_total_frames)
@@ -376,7 +446,15 @@ def write_dynamic_assets(
             continue
 
         # Single mask + center pass per frame (create_live_overlay + project_fuel duplicated this).
-        mask = roi_yellow_mask_binary(frame, bbox, field_quad, quad_mask_roi=roi_quad_mask)
+        mask, prev_gray_roi = roi_yellow_mask_binary(
+            frame,
+            bbox,
+            field_quad,
+            quad_mask_roi=roi_quad_mask,
+            prev_gray_roi=prev_gray_roi,
+            use_motion_gate=use_motion_gate,
+            use_fast_mask=use_fast_mask,
+        )
         if mask is None or not np.any(mask):
             live_overlay = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
             field_frames.append([])
@@ -434,6 +512,16 @@ def main():
     parser.add_argument("--average-display-color", default="255,0,255", help="RGB color for the average intensity point")
     parser.add_argument("--pct-from-average-to-max", type=float, default=0.5)
     parser.add_argument("--field-image", default=DEFAULT_FIELD_IMAGE_PATH, help="Top-down field asset for field-map projection")
+    parser.add_argument(
+        "--no-motion",
+        action="store_true",
+        help="Disable frame-difference gating (treats moving yellow like static fuel).",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="HSV-only color mask (one fewer color convert); faster, more false positives on turf.",
+    )
     args = parser.parse_args()
 
     bbox = parse_bbox(args.bbox)
@@ -452,6 +540,8 @@ def main():
         args.video,
         bbox=bbox,
         progress_callback=on_analyze_progress,
+        use_motion_gate=not args.no_motion,
+        use_fast_mask=args.fast,
     )
 
     emit_progress("encode", analyze_half, total_work)
@@ -499,6 +589,8 @@ def main():
         progress_callback=on_frames_progress,
         progress_total_frames=total_work,
         progress_offset=analyze_half,
+        use_motion_gate=not args.no_motion,
+        use_fast_mask=args.fast,
     )
 
     stats = {

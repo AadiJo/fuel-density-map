@@ -130,6 +130,9 @@ function resolveWindowsExecutable(exeName: string): string | null {
 const SPAWN_ENV = IS_WIN ? envWithWindowsPathExtras() : process.env
 
 const PYTHON_BIN = Bun.env.PYTHON_BIN ?? 'python'
+/** Set to `1` or `true` to pass `--fast` to processor_cli (HSV-only; faster, more turf FP). */
+const FUEL_PROCESSOR_FAST =
+  Bun.env.FUEL_PROCESSOR_FAST === '1' || Bun.env.FUEL_PROCESSOR_FAST === 'true'
 const FFMPEG_BIN =
   Bun.env.FFMPEG_BIN ??
   (IS_WIN ? resolveWindowsExecutable('ffmpeg.exe') : null) ??
@@ -773,6 +776,7 @@ async function processSession(sessionId: string) {
               pixelQuad.map((point) => `${point.x},${point.y}`).join(','),
             ]
           : []),
+        ...(FUEL_PROCESSOR_FAST ? (['--fast'] as const) : []),
       ],
       runStartedAt,
     )
@@ -955,6 +959,7 @@ Bun.serve({
           pythonBin: PYTHON_BIN,
           ffmpegBin: FFMPEG_BIN,
           ffprobeBin: FFPROBE_BIN,
+          fuelProcessorFast: FUEL_PROCESSOR_FAST,
         })
       }
 
