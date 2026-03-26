@@ -43,11 +43,38 @@ def compute_total_work_units(video_path):
 
 
 FIELD_DESTINATION_BOUNDS = {
-    "top_left": (0.064, 0.053),
+    "top_left": (0.133, 0.053),
     "top_right": (0.866, 0.053),
-    "bottom_right": (0.866, 0.945),
-    "bottom_left": (0.064, 0.945),
+    "bottom_right": (0.866, 0.946),
+    "bottom_left": (0.133, 0.946),
 }
+
+# Normalized polygons on the field asset for the two side hex goals. Any projected fuel point
+# that lands inside these shapes is excluded from the field-map export.
+FIELD_FUEL_EXCLUSION_ZONES = (
+    np.array(
+        [
+            [0.2812, 0.4991],
+            [0.2966, 0.4302],
+            [0.3302, 0.4302],
+            [0.3461, 0.4991],
+            [0.3302, 0.5660],
+            [0.2966, 0.5660],
+        ],
+        dtype=np.float32,
+    ),
+    np.array(
+        [
+            [0.6178, 0.4991],
+            [0.6337, 0.4302],
+            [0.6675, 0.4302],
+            [0.6834, 0.4991],
+            [0.6675, 0.5660],
+            [0.6337, 0.5660],
+        ],
+        dtype=np.float32,
+    ),
+)
 
 
 def create_color_array(raw_data, max_value, average_of_non_zero_values, average_display_color):
@@ -276,6 +303,14 @@ def component_radius(area):
     return int(np.clip(4.5 + np.sqrt(max(area, 1)) / 2.0, 5, 16))
 
 
+def point_is_in_field_fuel_exclusion_zone(normalized_x, normalized_y):
+    point = (float(normalized_x), float(normalized_y))
+    for polygon in FIELD_FUEL_EXCLUSION_ZONES:
+        if cv2.pointPolygonTest(polygon, point, False) >= 0:
+            return True
+    return False
+
+
 def project_fuel_points_from_centers(centers, bbox, projection_matrix, field_width, field_height):
     if not centers:
         return []
@@ -292,8 +327,12 @@ def project_fuel_points_from_centers(centers, bbox, projection_matrix, field_wid
     for px, py in projected:
         px = float(np.clip(px, min_x, max_x))
         py = float(np.clip(py, min_y, max_y))
-        normalized_x = int(round(np.clip(px * inv_fw, 0.0, 1.0) * 10000))
-        normalized_y = int(round(np.clip(py * inv_fh, 0.0, 1.0) * 10000))
+        normalized_fx = float(np.clip(px * inv_fw, 0.0, 1.0))
+        normalized_fy = float(np.clip(py * inv_fh, 0.0, 1.0))
+        if point_is_in_field_fuel_exclusion_zone(normalized_fx, normalized_fy):
+            continue
+        normalized_x = int(round(normalized_fx * 10000))
+        normalized_y = int(round(normalized_fy * 10000))
         points.append([normalized_x, normalized_y, FIELD_MAP_FUEL_RADIUS])
     return points
 

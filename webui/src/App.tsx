@@ -40,37 +40,30 @@ const FIELD_ASSET_URL = '/assets/rebuilt-field.png'
 
 /** Normalized 0–1 coords on the full field PNG; must match processor_cli.py FIELD_DESTINATION_BOUNDS. */
 const FIELD_IMAGE_NORM_BOUNDS = {
-  minX: 0.064,
+  minX: 0.133,
   maxX: 0.866,
   minY: 0.053,
-  maxY: 0.945,
+  maxY: 0.946,
 } as const
 
-/**
- * Display-only x correction: error is small near the center line and grows toward the red
- * wall. Anchor at the field midline; on the red half, scale distance from center by a factor
- * that ramps from full strength at the left edge to none at the center (blue half unchanged).
- */
-const FIELD_IMAGE_DISPLAY_RED_EDGE_COMPRESS = 0.82
-
-function remapFieldNormXForDisplay(fx: number): number {
-  const { minX, maxX } = FIELD_IMAGE_NORM_BOUNDS
-  const k = FIELD_IMAGE_DISPLAY_RED_EDGE_COMPRESS
-  if (k >= 1) {
-    return fx
-  }
-  const centerX = (minX + maxX) / 2
-  if (fx >= centerX) {
-    return fx
-  }
-  const span = centerX - minX
-  if (span <= 0) {
-    return fx
-  }
-  const u = (fx - minX) / span
-  const s = k + (1 - k) * u
-  return centerX + (fx - centerX) * s
-}
+const FIELD_FUEL_EXCLUSION_ZONES = [
+  [
+    { x: 0.2812, y: 0.4991 },
+    { x: 0.2966, y: 0.4302 },
+    { x: 0.3302, y: 0.4302 },
+    { x: 0.3461, y: 0.4991 },
+    { x: 0.3302, y: 0.566 },
+    { x: 0.2966, y: 0.566 },
+  ],
+  [
+    { x: 0.6178, y: 0.4991 },
+    { x: 0.6337, y: 0.4302 },
+    { x: 0.6675, y: 0.4302 },
+    { x: 0.6834, y: 0.4991 },
+    { x: 0.6675, y: 0.566 },
+    { x: 0.6337, y: 0.566 },
+  ],
+] as const
 
 function sortSessions(sessions: Session[]) {
   return [...sessions].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
@@ -266,6 +259,26 @@ function statusLabel(status: SessionStatus) {
 
 function clamp(value: number, min = 0, max = 1) {
   return Math.min(Math.max(value, min), max)
+}
+
+function pointInPolygon(x: number, y: number, polygon: readonly Point[]) {
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x
+    const yi = polygon[i].y
+    const xj = polygon[j].x
+    const yj = polygon[j].y
+    const intersects =
+      yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / ((yj - yi) || Number.EPSILON) + xi
+    if (intersects) {
+      inside = !inside
+    }
+  }
+  return inside
+}
+
+function pointIsInFieldFuelExclusionZone(x: number, y: number) {
+  return FIELD_FUEL_EXCLUSION_ZONES.some((polygon) => pointInPolygon(x, y, polygon))
 }
 
 function boxToPixels(box: BBox | null, session: Session | null) {
@@ -536,7 +549,9 @@ function drawFieldMapFrame(
     // below the inset (e.g. nx→0 from clipped px) must not map into the PNG margins.
     fx = clamp(fx, FIELD_IMAGE_NORM_BOUNDS.minX, FIELD_IMAGE_NORM_BOUNDS.maxX)
     fy = clamp(fy, FIELD_IMAGE_NORM_BOUNDS.minY, FIELD_IMAGE_NORM_BOUNDS.maxY)
-    fx = remapFieldNormXForDisplay(fx)
+    if (pointIsInFieldFuelExclusionZone(fx, fy)) {
+      continue
+    }
 
     let x: number
     let y: number
@@ -553,11 +568,21 @@ function drawFieldMapFrame(
       y = clamp(y, r, rect.height - r)
     }
 
+    const glow = context.createRadialGradient(x, y, r * 0.2, x, y, r * 2.6)
+    glow.addColorStop(0, 'rgba(255, 232, 110, 0.62)')
+    glow.addColorStop(0.45, 'rgba(245, 212, 62, 0.34)')
+    glow.addColorStop(1, 'rgba(245, 212, 62, 0)')
+
+    context.beginPath()
+    context.arc(x, y, r * 2.6, 0, Math.PI * 2)
+    context.fillStyle = glow
+    context.fill()
+
     context.beginPath()
     context.arc(x, y, r, 0, Math.PI * 2)
-    context.fillStyle = 'rgba(245, 212, 62, 0.92)'
-    context.shadowColor = 'rgba(245, 212, 62, 0.42)'
-    context.shadowBlur = r * 1.8
+    context.fillStyle = 'rgba(224, 175, 34, 0.96)'
+    context.shadowColor = 'rgba(245, 212, 62, 0.32)'
+    context.shadowBlur = r * 0.95
     context.fill()
   }
 
