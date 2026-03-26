@@ -1,6 +1,6 @@
-import { spawn } from 'node:child_process'
+import { execSync, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 type SessionStatus = 'idle' | 'downloading' | 'ready' | 'processing' | 'completed' | 'error'
@@ -34,6 +34,17 @@ type OverlayStats = {
   overlayFrameCount: number
 }
 
+/** Matches processor_cli.py PROGRESS_PREFIX / emit_progress JSON lines. */
+const PROGRESS_JSON_PREFIX = 'PROGRESS_JSON:'
+
+type ProcessingProgress = {
+  phase: string
+  current: number
+  total: number
+  startedAt: string
+  updatedAt: string
+}
+
 type SessionRecord = {
   id: string
   title: string
@@ -59,10 +70,74 @@ type SessionRecord = {
     stats: OverlayStats
   } | null
   lastError: string | null
+  processingProgress: ProcessingProgress | null
 }
 
 const ROOT_DIR = process.cwd()
+const IS_WIN = process.platform === 'win32'
+
+/**
+ * GUI/IDE-launched Bun often inherits a shorter PATH than an interactive terminal, so `ffmpeg.exe`
+ * is ENOENT even when `where ffmpeg` works in PowerShell. We merge common install locations, then
+ * resolve a full path with `where.exe`.
+ */
+function envWithWindowsPathExtras(): NodeJS.ProcessEnv {
+  if (!IS_WIN) {
+    return process.env
+  }
+  const pathKey = 'Path'
+  const pf = process.env.ProgramFiles ?? 'C:\\Program Files'
+  const pfx86 = process.env['ProgramFiles(x86)'] ?? ''
+  const local = process.env.LOCALAPPDATA ?? ''
+  const userProfile = process.env.USERPROFILE ?? ''
+  const choco = process.env.ChocolateyInstall
+  const extras = [
+    path.join(pf, 'ffmpeg', 'bin'),
+    path.join(pfx86, 'ffmpeg', 'bin'),
+    'C:\\ffmpeg\\bin',
+    path.join(local, 'Microsoft', 'WinGet', 'Links'),
+    userProfile ? path.join(userProfile, 'scoop', 'shims') : '',
+    choco ? path.join(choco, 'bin') : '',
+  ].filter((p): p is string => Boolean(p && p.length > 2))
+  const cur = process.env[pathKey] ?? ''
+  const merged = [cur, ...extras].filter(Boolean).join(path.delimiter)
+  return { ...process.env, [pathKey]: merged }
+}
+
+function resolveWindowsExecutable(exeName: string): string | null {
+  if (!IS_WIN) {
+    return null
+  }
+  try {
+    const out = execSync(`where.exe ${exeName}`, {
+      encoding: 'utf8',
+      windowsHide: true,
+      env: envWithWindowsPathExtras(),
+    })
+    const first = out
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l.length > 0 && !l.toLowerCase().startsWith('info:'))
+    if (!first) {
+      return null
+    }
+    return existsSync(first) ? first : null
+  } catch {
+    return null
+  }
+}
+
+const SPAWN_ENV = IS_WIN ? envWithWindowsPathExtras() : process.env
+
 const PYTHON_BIN = Bun.env.PYTHON_BIN ?? 'python'
+const FFMPEG_BIN =
+  Bun.env.FFMPEG_BIN ??
+  (IS_WIN ? resolveWindowsExecutable('ffmpeg.exe') : null) ??
+  (IS_WIN ? 'ffmpeg.exe' : 'ffmpeg')
+const FFPROBE_BIN =
+  Bun.env.FFPROBE_BIN ??
+  (IS_WIN ? resolveWindowsExecutable('ffprobe.exe') : null) ??
+  (IS_WIN ? 'ffprobe.exe' : 'ffprobe')
 const PORT = Number(Bun.env.PORT ?? '3001')
 const SESSIONS_DIR = path.join(ROOT_DIR, 'sessions')
 const CLIENT_DIST_DIR = path.join(ROOT_DIR, 'webui', 'dist')
@@ -239,6 +314,7 @@ async function readSessionRecord(sessionId: string) {
   return {
     ...parsed,
     fieldQuad: parsed.fieldQuad ?? null,
+    processingProgress: parsed.processingProgress ?? null,
   }
 }
 
@@ -303,9 +379,17 @@ async function listSessions() {
   return sessions
 }
 
+function spawnNotFoundMessage(command: string, err: NodeJS.ErrnoException) {
+  const base = `Could not start "${command}" (${err.message}).`
+  if (/ffmpeg|ffprobe/i.test(command)) {
+    return `${base} Install FFmpeg, then set FFMPEG_BIN and FFPROBE_BIN to the full paths from PowerShell, e.g. (Get-Command ffmpeg).Source. The IDE often uses a shorter PATH than your terminal; absolute paths avoid that.`
+  }
+  return `${base} Check that the program is installed and on PATH, or set the corresponding *_BIN environment variable.`
+}
+
 async function runCommand(command: string, args: string[], cwd = ROOT_DIR) {
   return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(command, args, { cwd, windowsHide: true })
+    const child = spawn(command, args, { cwd, windowsHide: true, env: SPAWN_ENV })
     let stdout = ''
     let stderr = ''
 
@@ -317,7 +401,14 @@ async function runCommand(command: string, args: string[], cwd = ROOT_DIR) {
       stderr += chunk.toString()
     })
 
-    child.on('error', reject)
+    child.on('error', (err) => {
+      const e = err as NodeJS.ErrnoException
+      if (e.code === 'ENOENT') {
+        reject(new Error(spawnNotFoundMessage(command, e)))
+        return
+      }
+      reject(err)
+    })
     child.on('close', (code) => {
       if (code === 0) {
         resolve({ stdout, stderr })
@@ -325,6 +416,92 @@ async function runCommand(command: string, args: string[], cwd = ROOT_DIR) {
       }
 
       reject(new Error(stderr.trim() || stdout.trim() || `${command} exited with code ${code}`))
+    })
+  })
+}
+
+async function runProcessorWithProgress(
+  record: SessionRecord,
+  args: string[],
+  runStartedAt: string,
+): Promise<{ stdout: string; stderr: string }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(PYTHON_BIN, ['-u', ...args], {
+      cwd: ROOT_DIR,
+      windowsHide: true,
+      env: { ...SPAWN_ENV, PYTHONUNBUFFERED: '1' },
+    })
+    let stdout = ''
+    let stderr = ''
+    let stderrLineBuf = ''
+
+    let writeTimer: ReturnType<typeof setTimeout> | null = null
+    const flushRecord = () => {
+      void writeSessionRecord(record).catch(() => {})
+    }
+    const schedulePersist = () => {
+      if (writeTimer) {
+        clearTimeout(writeTimer)
+      }
+      writeTimer = setTimeout(() => {
+        writeTimer = null
+        flushRecord()
+      }, 250)
+    }
+
+    const applyProgressLine = (jsonPart: string) => {
+      try {
+        const payload = JSON.parse(jsonPart) as { phase?: string; current?: number; total?: number }
+        if (!payload.phase || typeof payload.current !== 'number' || typeof payload.total !== 'number') {
+          return
+        }
+        const now = new Date().toISOString()
+        record.processingProgress = {
+          phase: payload.phase,
+          current: payload.current,
+          total: Math.max(1, payload.total),
+          startedAt: runStartedAt,
+          updatedAt: now,
+        }
+        record.updatedAt = now
+        schedulePersist()
+      } catch {
+        /* ignore malformed progress lines */
+      }
+    }
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString()
+    })
+
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString()
+      stderr += text
+      stderrLineBuf += text
+      const lines = stderrLineBuf.split('\n')
+      stderrLineBuf = lines.pop() ?? ''
+      for (const line of lines) {
+        if (line.startsWith(PROGRESS_JSON_PREFIX)) {
+          applyProgressLine(line.slice(PROGRESS_JSON_PREFIX.length))
+        }
+      }
+    })
+
+    child.on('error', reject)
+    child.on('close', (code) => {
+      if (writeTimer) {
+        clearTimeout(writeTimer)
+        writeTimer = null
+      }
+      if (stderrLineBuf.startsWith(PROGRESS_JSON_PREFIX)) {
+        applyProgressLine(stderrLineBuf.slice(PROGRESS_JSON_PREFIX.length))
+      }
+      flushRecord()
+      if (code === 0) {
+        resolve({ stdout, stderr })
+        return
+      }
+      reject(new Error(stderr.trim() || stdout.trim() || `${PYTHON_BIN} exited with code ${code}`))
     })
   })
 }
@@ -376,7 +553,98 @@ async function downloadVideo(url: string, record: SessionRecord) {
   record.video.fileName = fileName
 }
 
-async function importSession(url: string) {
+async function probeVideoDurationSeconds(filePath: string): Promise<number> {
+  const { stdout } = await runCommand(FFPROBE_BIN, [
+    '-v',
+    'error',
+    '-show_entries',
+    'format=duration',
+    '-of',
+    'default=noprint_wrappers=1:nokey=1',
+    filePath,
+  ])
+  const value = Number.parseFloat(stdout.trim())
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error('Could not read video duration.')
+  }
+  return value
+}
+
+async function trimSessionVideo(sessionId: string, trimStartSec: number, trimEndSec: number) {
+  const record = await readSessionRecord(sessionId)
+  if (!record.video.fileName) {
+    throw new Error('No video file for this session.')
+  }
+
+  const dir = sessionDir(sessionId)
+  const inputPath = path.join(dir, record.video.fileName)
+  if (!existsSync(inputPath)) {
+    throw new Error('Video file is missing on disk.')
+  }
+
+  const metaDuration = record.video.duration ?? (await probeVideoDurationSeconds(inputPath))
+  let start = Math.max(0, trimStartSec)
+  let end = Math.min(metaDuration, trimEndSec)
+  if (end <= start) {
+    throw new Error('End time must be after start time.')
+  }
+  const length = end - start
+
+  const ext = path.extname(record.video.fileName) || '.mp4'
+  const tmpOut = path.join(dir, `video-trimmed${ext}`)
+
+  try {
+    await runCommand(FFMPEG_BIN, [
+      '-y',
+      '-ss',
+      String(start),
+      '-i',
+      inputPath,
+      '-t',
+      String(length),
+      '-c',
+      'copy',
+      '-movflags',
+      '+faststart',
+      tmpOut,
+    ])
+  } catch {
+    await runCommand(FFMPEG_BIN, [
+      '-y',
+      '-ss',
+      String(start),
+      '-i',
+      inputPath,
+      '-t',
+      String(length),
+      '-c:v',
+      'libx264',
+      '-preset',
+      'fast',
+      '-crf',
+      '20',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '192k',
+      '-movflags',
+      '+faststart',
+      tmpOut,
+    ])
+  }
+
+  const newDuration = await probeVideoDurationSeconds(tmpOut)
+  await rm(inputPath)
+  await rename(tmpOut, path.join(dir, record.video.fileName))
+
+  record.video.duration = newDuration
+  record.updatedAt = new Date().toISOString()
+  await writeSessionRecord(record)
+  return record
+}
+
+async function importSession(url: string): Promise<{ record: SessionRecord; videoJustDownloaded: boolean }> {
+  let videoJustDownloaded = false
   const metadata = await getYouTubeMetadata(url)
   const id = createSessionId(metadata.title, metadata.videoId)
   const now = new Date().toISOString()
@@ -414,6 +682,7 @@ async function importSession(url: string) {
       },
       overlay: null,
       lastError: null,
+      processingProgress: null,
     }
   }
 
@@ -427,6 +696,7 @@ async function importSession(url: string) {
 
     try {
       await downloadVideo(url, record)
+      videoJustDownloaded = true
       record.status = record.overlay ? 'completed' : 'ready'
       record.updatedAt = new Date().toISOString()
       await writeSessionRecord(record)
@@ -439,7 +709,7 @@ async function importSession(url: string) {
     }
   }
 
-  return record
+  return { record, videoJustDownloaded }
 }
 
 async function updateSession(sessionId: string, mutator: (record: SessionRecord) => void | Promise<void>) {
@@ -472,27 +742,45 @@ async function processSession(sessionId: string) {
     : null
   const videoPath = path.join(sessionDir(sessionId), record.video.fileName)
 
+  const runStartedAt = new Date().toISOString()
   record.status = 'processing'
   record.lastError = null
-  record.updatedAt = new Date().toISOString()
+  record.processingProgress = {
+    phase: 'starting',
+    current: 0,
+    total: 1,
+    startedAt: runStartedAt,
+    updatedAt: runStartedAt,
+  }
+  record.updatedAt = runStartedAt
   await writeSessionRecord(record)
 
+  const logPath = path.join(sessionDir(sessionId), 'process.log')
   try {
-    await runCommand(PYTHON_BIN, [
-      'processor_cli.py',
-      '--video',
-      videoPath,
-      '--session-dir',
-      sessionDir(sessionId),
-      '--bbox',
-      `${pixelBox.x},${pixelBox.y},${pixelBox.width},${pixelBox.height}`,
-      ...(pixelQuad
-        ? [
-            '--quad',
-            pixelQuad.map((point) => `${point.x},${point.y}`).join(','),
-          ]
-        : []),
-    ])
+    const { stdout, stderr } = await runProcessorWithProgress(
+      record,
+      [
+        'processor_cli.py',
+        '--video',
+        videoPath,
+        '--session-dir',
+        sessionDir(sessionId),
+        '--bbox',
+        `${pixelBox.x},${pixelBox.y},${pixelBox.width},${pixelBox.height}`,
+        ...(pixelQuad
+          ? [
+              '--quad',
+              pixelQuad.map((point) => `${point.x},${point.y}`).join(','),
+            ]
+          : []),
+      ],
+      runStartedAt,
+    )
+    await writeFile(
+      logPath,
+      [stdout, stderr].filter(Boolean).join(stdout && stderr ? '\n--- stderr ---\n' : '\n'),
+      'utf8',
+    )
 
     const statsPath = path.join(sessionDir(sessionId), 'stats.json')
     const stats = JSON.parse(await readFile(statsPath, 'utf8')) as OverlayStats
@@ -507,14 +795,21 @@ async function processSession(sessionId: string) {
     }
     record.bbox = normalizedBBox
     record.status = 'completed'
+    record.processingProgress = null
     record.updatedAt = new Date().toISOString()
     await writeSessionRecord(record)
     return record
   } catch (error) {
     record.status = 'error'
     record.lastError = error instanceof Error ? error.message : 'Overlay generation failed.'
+    record.processingProgress = null
     record.updatedAt = new Date().toISOString()
     await writeSessionRecord(record)
+    try {
+      await writeFile(logPath, record.lastError, 'utf8')
+    } catch {
+      /* ignore log write errors */
+    }
     throw error
   }
 }
@@ -658,6 +953,8 @@ Bun.serve({
           ok: true,
           sessionsDir: SESSIONS_DIR,
           pythonBin: PYTHON_BIN,
+          ffmpegBin: FFMPEG_BIN,
+          ffprobeBin: FFPROBE_BIN,
         })
       }
 
@@ -674,8 +971,27 @@ Bun.serve({
           return json({ error: 'Paste a YouTube link first.' }, { status: 400 })
         }
 
-        const record = await importSession(youtubeUrl)
-        return json(toClientSession(record))
+        const { record, videoJustDownloaded } = await importSession(youtubeUrl)
+        return json({ session: toClientSession(record), videoJustDownloaded })
+      }
+
+      const trimMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/trim-video$/)
+      if (request.method === 'POST' && trimMatch) {
+        const body = await parseBody<{ trimStartSec?: number; trimEndSec?: number }>(request)
+        const start = Number(body?.trimStartSec)
+        const end = Number(body?.trimEndSec)
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          return json({ error: 'trimStartSec and trimEndSec must be numbers (seconds).' }, { status: 400 })
+        }
+        try {
+          const record = await trimSessionVideo(trimMatch[1], start, end)
+          return json(toClientSession(record))
+        } catch (error) {
+          return json(
+            { error: error instanceof Error ? error.message : 'Could not trim video.' },
+            { status: 400 },
+          )
+        }
       }
 
       const sessionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/)
@@ -749,6 +1065,24 @@ Bun.serve({
       if (request.method === 'POST' && processMatch) {
         const record = await processSession(processMatch[1])
         return json(toClientSession(record))
+      }
+
+      const processLogMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/process-log$/)
+      if (request.method === 'GET' && processLogMatch) {
+        const sid = processLogMatch[1]
+        const logPath = path.join(sessionDir(sid), 'process.log')
+        let text = ''
+        if (existsSync(logPath)) {
+          text = await readFile(logPath, 'utf8')
+        } else {
+          const record = await readSessionRecord(sid)
+          if (record.lastError) {
+            text = `Last error: ${record.lastError}`
+          }
+        }
+        return new Response(text, {
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        })
       }
 
       const deleteMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/)

@@ -31,7 +31,9 @@ def clamp_bbox(bbox, frame_width, frame_height):
     return x, y, width, height
 
 
-def get_total_yellow_pixels_from_video(vid_path, start_time=0, end_time=None, bbox=None):
+def get_total_yellow_pixels_from_video(
+    vid_path, start_time=0, end_time=None, bbox=None, progress_callback=None
+):
     cap = cv2.VideoCapture(vid_path)
 
     fps = cap.get(cv2.CAP_PROP_FPS)  # frames per second
@@ -54,6 +56,10 @@ def get_total_yellow_pixels_from_video(vid_path, start_time=0, end_time=None, bb
     bbox = clamp_bbox(bbox, frame_width, frame_height)
     video_frame_totals = np.zeros((frame_height, frame_width), dtype=np.uint32)
 
+    phase_total = max(1, end_frame - start_frame)
+    processed = 0
+    progress_stride = max(1, phase_total // 150)
+
     # go frame by frame
     while frame_count < end_frame:
         if frame_count == start_frame or frame_count % max(int(fps), 1) == 0:
@@ -66,6 +72,13 @@ def get_total_yellow_pixels_from_video(vid_path, start_time=0, end_time=None, bb
         video_frame_totals += frame_mask
 
         frame_count += 1
+        processed += 1
+        if progress_callback and (
+            processed == 1
+            or processed % progress_stride == 0
+            or processed >= phase_total
+        ):
+            progress_callback(processed, phase_total)
     cap.release()
     print()
     return video_frame_totals

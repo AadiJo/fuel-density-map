@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 
 import cv2
 import numpy as np
@@ -15,6 +16,31 @@ DEFAULT_FIELD_IMAGE_PATH = os.path.join(
     "assets",
     "rebuilt-field.png",
 )
+
+PROGRESS_PREFIX = "PROGRESS_JSON:"
+
+
+def emit_progress(phase, current, total):
+    """Machine-readable progress for the Node server (stderr, line-buffered)."""
+    line = f'{PROGRESS_PREFIX}{json.dumps({"phase": phase, "current": current, "total": total})}\n'
+    sys.stderr.write(line)
+    sys.stderr.flush()
+
+
+def compute_total_work_units(video_path):
+    """Two full passes: accumulate analysis + per-frame overlay/field export."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if fps <= 0:
+        fps = 30.0
+    frame_count_cap = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    end_time = frame_count_cap / fps if fps > 0 else 0
+    end_frame = int(end_time * fps)
+    start_frame = int(0 * fps)
+    analyze_total = max(1, end_frame - start_frame)
+    cap.release()
+    return max(1, analyze_total * 2)
+
 
 FIELD_DESTINATION_BOUNDS = {
     "top_left": (0.064, 0.053),
@@ -100,7 +126,17 @@ def quad_mask(bbox, field_quad):
     return mask
 
 
-def roi_yellow_mask_binary(frame, bbox, field_quad):
+_MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+
+
+def precompute_roi_quad_mask(bbox, field_quad):
+    """Quad intersection mask depends only on bbox + quad, not on video frame."""
+    if field_quad is None:
+        return None
+    return quad_mask(bbox, field_quad)
+
+
+def roi_yellow_mask_binary(frame, bbox, field_quad, quad_mask_roi=None):
     """HSV yellow mask cropped to the ROI and field quad, with light noise removal."""
     x, y, width, height = bbox
     frame_slice = frame[y : y + height, x : x + width]
@@ -108,11 +144,9 @@ def roi_yellow_mask_binary(frame, bbox, field_quad):
         return None
     mask = analysis.yellow_pixel_mask_hsv(frame_slice)
     if field_quad is not None:
-        mask = cv2.bitwise_and(mask, quad_mask(bbox, field_quad))
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)),
-    )
+        qm = quad_mask_roi if quad_mask_roi is not None else quad_mask(bbox, field_quad)
+        mask = cv2.bitwise_and(mask, qm)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _MORPH_KERNEL_OPEN)
     return mask
 
 
@@ -208,6 +242,22 @@ FIELD_MAP_FUEL_RADIUS = 10
 
 OVERLAY_FUEL_DOT_RADIUS_PX = 5
 
+# Export every Nth source frame (2 = half the work and half the files; stats fps is scaled so UI stays in sync).
+OVERLAY_FRAME_STRIDE = 2
+
+
+def draw_fuel_dots_full_frame(height, width, bbox, centers, overlay_color):
+    """RGB canvas; LINE_8 is much faster than LINE_AA for hundreds of small circles."""
+    out = np.zeros((height, width, 3), dtype=np.uint8)
+    if not centers:
+        return out
+    color = tuple(int(c) for c in overlay_color)
+    dot_r = OVERLAY_FUEL_DOT_RADIUS_PX
+    x0, y0 = bbox[0], bbox[1]
+    for cx, cy in centers:
+        cv2.circle(out, (int(x0 + cx), int(y0 + cy)), dot_r, color, -1, lineType=cv2.LINE_8)
+    return out
+
 
 def create_live_overlay_frame(frame, bbox, field_quad, overlay_color):
     """
@@ -215,42 +265,45 @@ def create_live_overlay_frame(frame, bbox, field_quad, overlay_color):
     (not dilate+blur — that merged entire clusters into one pink smear).
     """
     h, w = frame.shape[:2]
-    out = np.zeros((h, w, 3), dtype=np.uint8)
     mask = roi_yellow_mask_binary(frame, bbox, field_quad)
     if mask is None or not np.any(mask):
-        return out
-
+        return np.zeros((h, w, 3), dtype=np.uint8)
     centers = ball_centers_from_mask(mask)
-    color = tuple(int(c) for c in overlay_color)
-    dot_r = OVERLAY_FUEL_DOT_RADIUS_PX
-    x0, y0 = bbox[0], bbox[1]
-    for cx, cy in centers:
-        cv2.circle(out, (int(x0 + cx), int(y0 + cy)), dot_r, color, -1, lineType=cv2.LINE_AA)
-    return out
+    return draw_fuel_dots_full_frame(h, w, bbox, centers, overlay_color)
 
 
 def component_radius(area):
     return int(np.clip(4.5 + np.sqrt(max(area, 1)) / 2.0, 5, 16))
 
 
+def project_fuel_points_from_centers(centers, bbox, projection_matrix, field_width, field_height):
+    if not centers:
+        return []
+    x0, y0 = bbox[0], bbox[1]
+    src = np.array([[[x0 + cx, y0 + cy]] for cx, cy in centers], dtype=np.float32)
+    projected = cv2.perspectiveTransform(src, projection_matrix).reshape(-1, 2)
+    points = []
+    inv_fw = 1.0 / float(field_width)
+    inv_fh = 1.0 / float(field_height)
+    min_x = field_width * FIELD_DESTINATION_BOUNDS["top_left"][0]
+    max_x = field_width * FIELD_DESTINATION_BOUNDS["top_right"][0]
+    min_y = field_height * FIELD_DESTINATION_BOUNDS["top_left"][1]
+    max_y = field_height * FIELD_DESTINATION_BOUNDS["bottom_left"][1]
+    for px, py in projected:
+        px = float(np.clip(px, min_x, max_x))
+        py = float(np.clip(py, min_y, max_y))
+        normalized_x = int(round(np.clip(px * inv_fw, 0.0, 1.0) * 10000))
+        normalized_y = int(round(np.clip(py * inv_fh, 0.0, 1.0) * 10000))
+        points.append([normalized_x, normalized_y, FIELD_MAP_FUEL_RADIUS])
+    return points
+
+
 def project_fuel_points(frame, bbox, field_quad, projection_matrix, field_width, field_height):
-    x, y, width, height = bbox
     mask = roi_yellow_mask_binary(frame, bbox, field_quad)
     if mask is None or not np.any(mask):
         return []
-
     peaks = ball_centers_from_mask(mask)
-    points = []
-
-    for centroid_x, centroid_y in peaks:
-        source_point = np.array([[[x + centroid_x, y + centroid_y]]], dtype=np.float32)
-        projected_point = cv2.perspectiveTransform(source_point, projection_matrix)[0, 0]
-
-        normalized_x = int(round(np.clip(projected_point[0] / field_width, 0.0, 1.0) * 10000))
-        normalized_y = int(round(np.clip(projected_point[1] / field_height, 0.0, 1.0) * 10000))
-        points.append([normalized_x, normalized_y, FIELD_MAP_FUEL_RADIUS])
-
-    return points
+    return project_fuel_points_from_centers(peaks, bbox, projection_matrix, field_width, field_height)
 
 
 def write_dynamic_assets(
@@ -261,6 +314,9 @@ def write_dynamic_assets(
     field_quad,
     average_display_color,
     field_image_path,
+    progress_callback=None,
+    progress_total_frames=None,
+    progress_offset=0,
 ):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -292,13 +348,49 @@ def write_dynamic_assets(
     os.makedirs(overlay_frames_dir, exist_ok=True)
     frame_count = 0
     field_frames = []
+    total_frames = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    progress_stride = max(1, total_frames // 150)
+    roi_quad_mask = precompute_roi_quad_mask(bbox, field_quad)
+    stride = max(1, int(OVERLAY_FRAME_STRIDE))
+    export_fps = float(fps) / float(stride)
 
+    if progress_callback and progress_total_frames is not None:
+        progress_callback(progress_offset, progress_total_frames)
+
+    video_read_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        video_read_count += 1
 
-        live_overlay = create_live_overlay_frame(frame, bbox, field_quad, average_display_color)
+        if progress_callback and progress_total_frames is not None:
+            if (
+                video_read_count == 1
+                or video_read_count % progress_stride == 0
+                or video_read_count >= total_frames
+            ):
+                progress_callback(progress_offset + video_read_count, progress_total_frames)
+
+        if (video_read_count - 1) % stride != 0:
+            continue
+
+        # Single mask + center pass per frame (create_live_overlay + project_fuel duplicated this).
+        mask = roi_yellow_mask_binary(frame, bbox, field_quad, quad_mask_roi=roi_quad_mask)
+        if mask is None or not np.any(mask):
+            live_overlay = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+            field_frames.append([])
+        else:
+            centers = ball_centers_from_mask(mask)
+            live_overlay = draw_fuel_dots_full_frame(
+                frame_height, frame_width, bbox, centers, average_display_color
+            )
+            field_frames.append(
+                project_fuel_points_from_centers(
+                    centers, bbox, projection_matrix, field_width, field_height
+                )
+            )
+
         success, encoded = cv2.imencode(
             ".webp",
             cv2.cvtColor(live_overlay, cv2.COLOR_RGB2BGR),
@@ -310,8 +402,6 @@ def write_dynamic_assets(
 
         frame_path = os.path.join(overlay_frames_dir, f"frame_{frame_count:06d}.webp")
         encoded.tofile(frame_path)
-
-        field_frames.append(project_fuel_points(frame, bbox, field_quad, projection_matrix, field_width, field_height))
         frame_count += 1
 
     cap.release()
@@ -321,7 +411,7 @@ def write_dynamic_assets(
             {
                 "imageWidth": field_width,
                 "imageHeight": field_height,
-                "fps": float(fps),
+                "fps": export_fps,
                 "frameCount": frame_count,
                 "frames": field_frames,
             },
@@ -330,7 +420,7 @@ def write_dynamic_assets(
         )
 
     return {
-        "fps": float(fps),
+        "fps": export_fps,
         "frameCount": frame_count,
     }
 
@@ -350,8 +440,21 @@ def main():
     field_quad = parse_quad(args.quad) if args.quad else None
     average_display_color = tuple(int(part.strip()) for part in args.average_display_color.split(","))
 
+    total_work = compute_total_work_units(args.video)
+    analyze_half = max(1, total_work // 2)
+    emit_progress("analyze", 0, total_work)
+
+    def on_analyze_progress(processed, phase_total):
+        emit_progress("analyze", min(processed, analyze_half), total_work)
+
     print("Analyzing video...")
-    raw_data = analysis.get_total_yellow_pixels_from_video(args.video, bbox=bbox)
+    raw_data = analysis.get_total_yellow_pixels_from_video(
+        args.video,
+        bbox=bbox,
+        progress_callback=on_analyze_progress,
+    )
+
+    emit_progress("encode", analyze_half, total_work)
 
     os.makedirs(args.session_dir, exist_ok=True)
 
@@ -378,7 +481,13 @@ def main():
     transparent_image = np.dstack((color_array, alpha_channel))
     Image.fromarray(transparent_image, mode="RGBA").save(transparent_overlay_path)
 
+    emit_progress("encode", analyze_half, total_work)
+
     print("Creating overlay frames...")
+
+    def on_frames_progress(global_current, total_work_units):
+        emit_progress("frames", min(global_current, total_work_units), total_work_units)
+
     overlay_timing = write_dynamic_assets(
         args.video,
         overlay_frames_dir,
@@ -387,6 +496,9 @@ def main():
         field_quad,
         average_display_color,
         args.field_image,
+        progress_callback=on_frames_progress,
+        progress_total_frames=total_work,
+        progress_offset=analyze_half,
     )
 
     stats = {

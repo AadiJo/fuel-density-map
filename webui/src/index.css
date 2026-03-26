@@ -1,15 +1,29 @@
 :root {
-  --bg: #07111d;
-  --bg-soft: #0f1b2f;
-  --panel: rgba(15, 23, 42, 0.78);
-  --text: #edf3ff;
-  --muted-strong: #c5d0de;
-  --muted: #8ea0b6;
-  --accent: #52c4ac;
-  --accent-warm: #f59e0b;
-  --danger: #fb7185;
-  --font-sans: 'Space Grotesk', 'Segoe UI Variable', 'Segoe UI', sans-serif;
-  --mono: 'JetBrains Mono', 'Cascadia Code', monospace;
+  --bg: #0c0c0c;
+  --bg-elevated: #141414;
+  --bg-surface: #1a1a1a;
+  --bg-hover: rgba(255, 255, 255, 0.04);
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.11);
+  --text: #e8e8e8;
+  --text-dim: #9d9d9d;
+  --text-faint: #6b6b6b;
+  --accent: #3b8eea;
+  --accent-muted: rgba(59, 142, 234, 0.16);
+  --accent-glow: rgba(59, 142, 234, 0.35);
+  --success: #3fb950;
+  --success-muted: rgba(63, 185, 80, 0.18);
+  --warn: #d29922;
+  --warn-muted: rgba(210, 153, 34, 0.2);
+  --danger: #f85149;
+  --danger-muted: rgba(248, 81, 73, 0.16);
+  --font-sans: 'DM Sans', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'Cascadia Code', ui-monospace, monospace;
+  --rail-width: 48px;
+  --sidebar-width: 232px;
+  --inspector-width: 268px;
+  --titlebar-height: 40px;
+  --statusbar-height: 24px;
   color: var(--text);
   font-family: var(--font-sans);
   line-height: 1.45;
@@ -26,16 +40,16 @@
 
 html {
   scroll-behavior: smooth;
+  height: 100%;
+  overflow: hidden;
 }
 
 body {
   margin: 0;
   min-width: 320px;
-  min-height: 100vh;
-  background:
-    radial-gradient(circle at top left, rgba(82, 196, 172, 0.18), transparent 30%),
-    radial-gradient(circle at top right, rgba(245, 158, 11, 0.14), transparent 26%),
-    linear-gradient(180deg, #091220 0%, #07111d 45%, #050b14 100%);
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
 }
 
 body::before {
@@ -43,11 +57,10 @@ body::before {
   position: fixed;
   inset: 0;
   pointer-events: none;
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
-  background-size: 42px 42px;
-  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.18), transparent 70%);
+  background-image: linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.35), transparent 72%);
 }
 
 button,
@@ -61,5 +74,6 @@ a {
 }
 
 #root {
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
 }

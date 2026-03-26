@@ -39,6 +39,14 @@ export type FieldMapData = {
   frames: FieldMapPoint[][]
 }
 
+export type ProcessingProgress = {
+  phase: string
+  current: number
+  total: number
+  startedAt: string
+  updatedAt: string
+}
+
 export type Session = {
   id: string
   title: string
@@ -71,6 +79,7 @@ export type Session = {
     fieldMapDataUrl: string | null
   }
   lastError: string | null
+  processingProgress: ProcessingProgress | null
 }
 
-export type DisplayMode = 'video' | 'overlay' | 'blend' | 'field'
+export type DisplayMode = 'match' | 'field'

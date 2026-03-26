@@ -1,5 +1,11 @@
 import type { BBox, FieldMapData, FieldQuad, Session } from './types'
 
+export type ImportSessionResult = {
+  session: Session
+  /** True when a new download just finished (not a cached session). */
+  videoJustDownloaded: boolean
+}
+
 async function request<T>(input: string, init?: RequestInit) {
   const response = await fetch(input, {
     ...init,
@@ -25,9 +31,15 @@ export const api = {
     return request<Session[]>('/api/sessions')
   },
   importSession(url: string) {
-    return request<Session>('/api/sessions/import', {
+    return request<ImportSessionResult>('/api/sessions/import', {
       method: 'POST',
       body: JSON.stringify({ url }),
+    })
+  },
+  trimVideo(sessionId: string, trimStartSec: number, trimEndSec: number) {
+    return request<Session>(`/api/sessions/${sessionId}/trim-video`, {
+      method: 'POST',
+      body: JSON.stringify({ trimStartSec, trimEndSec }),
     })
   },
   saveBBox(sessionId: string, bbox: BBox | null) {
@@ -61,5 +73,13 @@ export const api = {
   },
   getFieldMapData(url: string) {
     return request<FieldMapData>(url, { cache: 'no-store' })
+  },
+  async getProcessLog(sessionId: string) {
+    const response = await fetch(`/api/sessions/${sessionId}/process-log`, { cache: 'no-store' })
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null)
+      throw new Error(payload?.error ?? 'Request failed.')
+    }
+    return response.text()
   },
 }
