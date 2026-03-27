@@ -7,7 +7,8 @@
     "dev:api": "bun run server.ts",
     "build": "bun --cwd webui build",
     "lint": "bun --cwd webui lint",
-    "start": "bun run server.ts"
+    "start": "bun run server.ts",
+    "build:opencv-cuda": "python scripts/build_opencv_cuda.py"
   },
   "dependencies": {},
   "devDependencies": {

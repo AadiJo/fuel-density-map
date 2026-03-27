@@ -20,6 +20,7 @@ type Point = {
 type FieldQuad = [Point, Point, Point, Point]
 
 type OverlayStats = {
+  backend?: 'cpu' | 'cuda'
   bbox: {
     x: number
     y: number
@@ -32,6 +33,25 @@ type OverlayStats = {
   nonZeroPixels: number
   overlayFps: number
   overlayFrameCount: number
+  timings?: Record<string, number>
+  rawCenterCountSummary?: {
+    min: number
+    p50: number
+    p90: number
+    p95: number
+    max: number
+    mean: number
+  }
+  stableTrackCountSummary?: {
+    min: number
+    p50: number
+    p90: number
+    p95: number
+    max: number
+    mean: number
+  }
+  detectorBudgetHits?: number
+  saturatedFrameCount?: number
 }
 
 /** Matches processor_cli.py PROGRESS_PREFIX / emit_progress JSON lines. */
@@ -64,6 +84,8 @@ type SessionRecord = {
   overlay: {
     fileName: string
     transparentFileName: string
+    overlayVideoFileName: string | null
+    playbackMode?: 'video' | 'frames'
     framesDirName: string | null
     rawDataFileName: string
     fieldMapDataFileName: string | null
@@ -129,7 +151,13 @@ function resolveWindowsExecutable(exeName: string): string | null {
 
 const SPAWN_ENV = IS_WIN ? envWithWindowsPathExtras() : process.env
 
+const LOCAL_CUDA_VENV_PYTHON = IS_WIN
+  ? path.join(ROOT_DIR, '.venv-opencv-cuda', 'Scripts', 'python.exe')
+  : path.join(ROOT_DIR, '.venv-opencv-cuda', 'bin', 'python')
 const PYTHON_BIN = Bun.env.PYTHON_BIN ?? 'python'
+const PROCESSOR_PYTHON_BIN =
+  Bun.env.PROCESSOR_PYTHON_BIN ??
+  (existsSync(LOCAL_CUDA_VENV_PYTHON) ? LOCAL_CUDA_VENV_PYTHON : PYTHON_BIN)
 const FFMPEG_BIN =
   Bun.env.FFMPEG_BIN ??
   (IS_WIN ? resolveWindowsExecutable('ffmpeg.exe') : null) ??
@@ -324,8 +352,17 @@ async function writeSessionRecord(record: SessionRecord) {
 }
 
 function toClientSession(record: SessionRecord) {
+  const playbackMode = record.overlay?.playbackMode ?? 'frames'
+  const overlayVideoFileName =
+    playbackMode === 'video' &&
+    record.overlay?.overlayVideoFileName &&
+    existsSync(path.join(sessionDir(record.id), record.overlay.overlayVideoFileName))
+      ? record.overlay.overlayVideoFileName
+      : null
   const overlayFramesDirName =
-    record.overlay?.framesDirName && existsSync(path.join(sessionDir(record.id), record.overlay.framesDirName))
+    playbackMode === 'frames' &&
+    record.overlay?.framesDirName &&
+    existsSync(path.join(sessionDir(record.id), record.overlay.framesDirName))
       ? record.overlay.framesDirName
       : null
   const fieldMapDataFileName =
@@ -345,6 +382,10 @@ function toClientSession(record: SessionRecord) {
       overlayTransparentUrl:
         record.overlay?.transparentFileName
           ? `/media/${record.id}/${encodeURIComponent(record.overlay.transparentFileName)}`
+          : null,
+      overlayVideoUrl:
+        overlayVideoFileName
+          ? `/media/${record.id}/${encodeURIComponent(overlayVideoFileName)}`
           : null,
       overlayFrameUrlTemplate:
         overlayFramesDirName
@@ -426,7 +467,7 @@ async function runProcessorWithProgress(
   runStartedAt: string,
 ): Promise<{ stdout: string; stderr: string }> {
   return await new Promise((resolve, reject) => {
-    const child = spawn(PYTHON_BIN, ['-u', ...args], {
+    const child = spawn(PROCESSOR_PYTHON_BIN, ['-u', ...args], {
       cwd: ROOT_DIR,
       windowsHide: true,
       env: { ...SPAWN_ENV, PYTHONUNBUFFERED: '1' },
@@ -501,7 +542,7 @@ async function runProcessorWithProgress(
         resolve({ stdout, stderr })
         return
       }
-      reject(new Error(stderr.trim() || stdout.trim() || `${PYTHON_BIN} exited with code ${code}`))
+      reject(new Error(stderr.trim() || stdout.trim() || `${PROCESSOR_PYTHON_BIN} exited with code ${code}`))
     })
   })
 }
@@ -757,6 +798,14 @@ async function processSession(sessionId: string) {
 
   const logPath = path.join(sessionDir(sessionId), 'process.log')
   try {
+    const backendArg = Bun.env.PROCESSOR_BACKEND
+    const overlayOutputArg = Bun.env.PROCESSOR_OVERLAY_OUTPUT ?? 'frames'
+    const workingScaleArg = Bun.env.PROCESSOR_WORKING_SCALE
+    const detectorBudgetArg = Bun.env.PROCESSOR_DETECTOR_BUDGET
+    const maxActiveTracksArg = Bun.env.PROCESSOR_MAX_ACTIVE_TRACKS
+    const detectorModeArg = Bun.env.PROCESSOR_DETECTOR_MODE ?? 'legacy'
+    await rm(path.join(sessionDir(sessionId), 'overlay-video.mp4'), { force: true })
+    await rm(path.join(sessionDir(sessionId), 'overlay-frames'), { recursive: true, force: true })
     const { stdout, stderr } = await runProcessorWithProgress(
       record,
       [
@@ -773,6 +822,12 @@ async function processSession(sessionId: string) {
               pixelQuad.map((point) => `${point.x},${point.y}`).join(','),
             ]
           : []),
+        ...(backendArg ? ['--backend', backendArg] : []),
+        ...(overlayOutputArg ? ['--overlay-output', overlayOutputArg] : []),
+        ...(workingScaleArg ? ['--working-scale', workingScaleArg] : []),
+        ...(detectorBudgetArg ? ['--detector-budget', detectorBudgetArg] : []),
+        ...(maxActiveTracksArg ? ['--max-active-tracks', maxActiveTracksArg] : []),
+        ...(detectorModeArg ? ['--detector-mode', detectorModeArg] : []),
       ],
       runStartedAt,
     )
@@ -784,11 +839,22 @@ async function processSession(sessionId: string) {
 
     const statsPath = path.join(sessionDir(sessionId), 'stats.json')
     const stats = JSON.parse(await readFile(statsPath, 'utf8')) as OverlayStats
+    const playbackMode = overlayOutputArg === 'video' ? 'video' : 'frames'
+    const overlayVideoFileName =
+      playbackMode === 'video' && existsSync(path.join(sessionDir(sessionId), 'overlay-video.mp4'))
+        ? 'overlay-video.mp4'
+        : null
+    const overlayFramesDirName =
+      playbackMode === 'frames' && existsSync(path.join(sessionDir(sessionId), 'overlay-frames'))
+        ? 'overlay-frames'
+        : null
 
     record.overlay = {
       fileName: 'overlay.png',
       transparentFileName: 'overlay-transparent.png',
-      framesDirName: 'overlay-frames',
+      overlayVideoFileName,
+      playbackMode,
+      framesDirName: overlayFramesDirName,
       rawDataFileName: 'raw_data.txt',
       fieldMapDataFileName: 'field-map.json',
       stats,
@@ -953,6 +1019,7 @@ Bun.serve({
           ok: true,
           sessionsDir: SESSIONS_DIR,
           pythonBin: PYTHON_BIN,
+          processorPythonBin: PROCESSOR_PYTHON_BIN,
           ffmpegBin: FFMPEG_BIN,
           ffprobeBin: FFPROBE_BIN,
         })

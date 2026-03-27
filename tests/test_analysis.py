@@ -1,5 +1,8 @@
 import unittest
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 
 import cv2
 import numpy as np
@@ -21,6 +24,51 @@ def reference_analyze_frame(frame, bbox=None):
 
 class AnalysisTests(unittest.TestCase):
     def _write_test_video(self, path, frames, fps=5.0):
+        if not hasattr(cv2, "VideoWriter"):
+            ffmpeg = shutil.which('ffmpeg') or processor_cli.ffmpeg_binary()
+            if not ffmpeg:
+                self.skipTest("ffmpeg is required when OpenCV VideoWriter is unavailable.")
+            candidate = path.with_suffix(".mp4")
+            command = [
+                ffmpeg,
+                '-hide_banner',
+                '-loglevel',
+                'error',
+                '-y',
+                '-f',
+                'rawvideo',
+                '-pix_fmt',
+                'bgr24',
+                '-s',
+                f'{frames[0].shape[1]}x{frames[0].shape[0]}',
+                '-r',
+                str(fps),
+                '-i',
+                'pipe:0',
+                '-c:v',
+                'libx264',
+                '-pix_fmt',
+                'yuv420p',
+                str(candidate),
+            ]
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            assert proc.stdin is not None
+            for frame in frames:
+                proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            proc.stdin.close()
+            stderr_text = ""
+            if proc.stderr is not None:
+                stderr_text = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            return_code = proc.wait()
+            if return_code != 0:
+                self.fail(stderr_text or "Unable to create a test video with FFmpeg.")
+            return candidate
+
         for codec, suffix in (("MJPG", ".avi"), ("mp4v", ".mp4"), ("XVID", ".avi")):
             candidate = path.with_suffix(suffix)
             writer = cv2.VideoWriter(
@@ -71,14 +119,27 @@ class AnalysisTests(unittest.TestCase):
         temp_dir.mkdir(exist_ok=True)
         video_path = self._write_test_video(temp_dir / "analysis_fixture", source_frames)
         try:
-            cap = cv2.VideoCapture(str(video_path))
             decoded_frames = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                decoded_frames.append(frame)
-            cap.release()
+            if hasattr(cv2, "VideoCapture"):
+                cap = cv2.VideoCapture(str(video_path))
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    decoded_frames.append(frame)
+                cap.release()
+            else:
+                metadata = processor_cli.probe_video_metadata(str(video_path))
+                reader = processor_cli.FFmpegFrameReader(
+                    str(video_path),
+                    metadata["width"],
+                    metadata["height"],
+                    stride=1,
+                )
+                try:
+                    decoded_frames = list(reader)
+                finally:
+                    reader.close()
 
             expected = np.zeros(decoded_frames[0].shape[:2], dtype=np.uint32)
             for frame in decoded_frames:
@@ -154,6 +215,74 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(processor_cli.compute_frame_stride(30.0, 15.0), 2)
         self.assertEqual(processor_cli.compute_frame_stride(24.714, 15.0), 2)
         self.assertEqual(processor_cli.compute_frame_stride(14.0, 15.0), 1)
+
+    def test_peak_detector_respects_budget(self):
+        mask = np.zeros((120, 120), dtype=np.uint8)
+        for row in range(15, 110, 20):
+            for col in range(15, 110, 20):
+                cv2.circle(mask, (col, row), 4, 255, -1)
+
+        detector = processor_cli.PeakBallDetector(working_scale=1.0, detector_budget=5)
+        centers, saturated = detector.detect(mask)
+
+        self.assertTrue(saturated)
+        self.assertLessEqual(len(centers), 5)
+        self.assertGreater(len(centers), 0)
+
+    def test_temporal_stabilizer_caps_active_tracks(self):
+        stabilizer = processor_cli.FuelTemporalStabilizer(
+            max_active_tracks=10,
+            max_track_age=4,
+            max_misses=1,
+            history_size=4,
+            min_baseline_count=999,
+        )
+        centers = [(x * 12, 20) for x in range(30)]
+
+        first, bad_first = stabilizer.stabilize(centers, saturated=True)
+        second, bad_second = stabilizer.stabilize(centers, saturated=True)
+
+        self.assertFalse(bad_first)
+        self.assertFalse(bad_second)
+        self.assertLessEqual(len(first), 10)
+        self.assertLessEqual(len(second), 10)
+
+    def test_write_dynamic_assets_video_output_creates_overlay_video(self):
+        if shutil.which('ffmpeg') is None and not processor_cli.ffmpeg_binary():
+            self.skipTest('ffmpeg is not available')
+
+        source_frames = []
+        for idx in range(4):
+            frame = np.zeros((80, 100, 3), dtype=np.uint8)
+            frame[20 + idx:24 + idx, 30 + idx:34 + idx] = (30, 240, 240)
+            source_frames.append(frame)
+
+        temp_dir = Path(tempfile.mkdtemp(prefix='fdm-video-out-'))
+        video_path = self._write_test_video(temp_dir / "overlay_video_fixture", source_frames, fps=4.0)
+        try:
+            session_dir = temp_dir / 'session'
+            result = processor_cli.write_dynamic_assets(
+                str(video_path),
+                str(session_dir),
+                str(session_dir / 'field-map.json'),
+                str(session_dir / 'raw-data.txt'),
+                bbox=(0, 0, 100, 80),
+                field_quad=None,
+                average_display_color=(255, 0, 255),
+                field_image_path=processor_cli.DEFAULT_FIELD_IMAGE_PATH,
+                target_process_fps=4.0,
+                overlay_output='video',
+                backend_name='cpu',
+                working_scale=1.0,
+                detector_budget=32,
+                max_active_tracks=64,
+            )
+
+            self.assertEqual(result["overlayOutput"], "video")
+            self.assertEqual(result["overlayOutputMeta"]["overlayVideoFileName"], "overlay-video.mp4")
+            self.assertTrue((session_dir / 'overlay-video.mp4').exists())
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -4,3 +4,9 @@ node_modules
 webui/node_modules
 webui/dist
 sessions
+.venv
+.venv-opencv-cuda
+.venv-opencv-cuda-build
+.build
+.opencv-cuda-install
+__pycache__/

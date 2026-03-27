@@ -15,6 +15,7 @@ export type Point = {
 export type FieldQuad = [Point, Point, Point, Point]
 
 export type OverlayStats = {
+  backend?: 'cpu' | 'cuda'
   bbox: {
     x: number
     y: number
@@ -27,6 +28,25 @@ export type OverlayStats = {
   nonZeroPixels: number
   overlayFps: number
   overlayFrameCount: number
+  timings?: Record<string, number>
+  rawCenterCountSummary?: {
+    min: number
+    p50: number
+    p90: number
+    p95: number
+    max: number
+    mean: number
+  }
+  stableTrackCountSummary?: {
+    min: number
+    p50: number
+    p90: number
+    p95: number
+    max: number
+    mean: number
+  }
+  detectorBudgetHits?: number
+  saturatedFrameCount?: number
 }
 
 export type FieldMapPoint = [number, number, number]
@@ -66,6 +86,8 @@ export type Session = {
   overlay: {
     fileName: string
     transparentFileName: string
+    overlayVideoFileName: string | null
+    playbackMode?: 'video' | 'frames'
     framesDirName: string | null
     rawDataFileName: string
     fieldMapDataFileName: string | null
@@ -75,6 +97,7 @@ export type Session = {
     videoUrl: string | null
     overlayUrl: string | null
     overlayTransparentUrl: string | null
+    overlayVideoUrl: string | null
     overlayFrameUrlTemplate: string | null
     fieldMapDataUrl: string | null
   }

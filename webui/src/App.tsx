@@ -630,6 +630,7 @@ function App() {
   const layersPopoverRef = useRef<HTMLDivElement | null>(null)
   const processLogPreRef = useRef<HTMLPreElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const overlayVideoRef = useRef<HTMLVideoElement | null>(null)
   const trimPreviewVideoRef = useRef<HTMLVideoElement | null>(null)
   const fieldImageRef = useRef<HTMLImageElement | null>(null)
   const fieldCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -673,10 +674,19 @@ function App() {
   const hasIncompleteFieldSelection = draftFieldPoints.length > 0 && draftFieldPoints.length < 4
   const activePixelBox = hasIncompleteFieldSelection ? null : boxToPixels(selectedSession?.bbox ?? null, selectedSession)
   const overlayFrameUrl = buildOverlayFrameUrl(selectedSession?.media.overlayFrameUrlTemplate ?? null, overlayFrameIndex)
+  const overlayVideoUrl = selectedSession?.media.overlayVideoUrl
+    ? cacheBustUrl(selectedSession.media.overlayVideoUrl, selectedSession.updatedAt)
+    : null
   const isFieldMode = mode === 'field'
   const isMatchMode = mode === 'match'
   const overlayOpacityRendered =
     !showOverlayLayer ? 0 : showVideoLayer ? overlayOpacity : 1
+  const hasOverlayMedia =
+    Boolean(
+      selectedSession?.media.overlayVideoUrl ??
+        selectedSession?.media.overlayFrameUrlTemplate ??
+        selectedSession?.media.overlayTransparentUrl,
+    )
   const isProcessRunning = isProcessing || selectedSession?.status === 'processing'
 
   const processEtaSeconds = useMemo(
@@ -1005,6 +1015,16 @@ function App() {
   }, [isFieldMode, fieldMapData, selectedSession?.overlay])
 
   useEffect(() => {
+    if (!selectedSession?.media.overlayVideoUrl) {
+      if (overlayVideoRef.current) {
+        overlayVideoRef.current.pause()
+      }
+      return
+    }
+    syncOverlayVideoTime(videoRef.current?.currentTime ?? 0)
+  }, [selectedSession?.id, selectedSession?.media.overlayVideoUrl, selectedSession?.updatedAt])
+
+  useEffect(() => {
     if (!isFieldMode || !fieldMapData || !fieldCanvasRef.current) {
       return
     }
@@ -1051,6 +1071,21 @@ function App() {
     setOverlayFrameIndex(nextFrame)
   }
 
+  function syncOverlayVideoTime(targetTime?: number) {
+    const overlayVideo = overlayVideoRef.current
+    if (!overlayVideo) {
+      return
+    }
+    const sourceTime = targetTime ?? videoRef.current?.currentTime ?? 0
+    if (!Number.isFinite(sourceTime)) {
+      return
+    }
+    const drift = Math.abs((overlayVideo.currentTime || 0) - sourceTime)
+    if (drift > 0.05 || overlayVideo.paused) {
+      seekVideoTo(overlayVideo, sourceTime)
+    }
+  }
+
   function startPlaybackSync() {
     if (playbackFrameRef.current !== null) {
       window.cancelAnimationFrame(playbackFrameRef.current)
@@ -1064,6 +1099,7 @@ function App() {
           setCurrentTime(time)
         }
         syncOverlayFrame(time)
+        syncOverlayVideoTime(time)
       }
       playbackFrameRef.current = window.requestAnimationFrame(tick)
     }
@@ -1359,9 +1395,12 @@ function App() {
 
     if (video.paused) {
       syncOverlayFrame()
+      syncOverlayVideoTime()
       void video.play()
+      void overlayVideoRef.current?.play().catch(() => {})
     } else {
       video.pause()
+      overlayVideoRef.current?.pause()
     }
   }
 
@@ -1373,6 +1412,7 @@ function App() {
 
     video.currentTime = nextTime
     syncOverlayFrame(nextTime)
+    syncOverlayVideoTime(nextTime)
     setCurrentTime(nextTime)
   }
 
@@ -1414,22 +1454,28 @@ function App() {
     }
     setDuration(video.duration || selectedSession?.video.duration || 0)
     syncOverlayFrame(video.currentTime)
+    syncOverlayVideoTime(video.currentTime)
   }
 
   function handleVideoPlay() {
     setIsPlaying(true)
+    syncOverlayVideoTime(videoRef.current?.currentTime ?? 0)
+    void overlayVideoRef.current?.play().catch(() => {})
     startPlaybackSync()
   }
 
   function handleVideoPause() {
     setIsPlaying(false)
+    overlayVideoRef.current?.pause()
     stopPlaybackSync()
   }
 
   function handleVideoEnded() {
     setIsPlaying(false)
+    overlayVideoRef.current?.pause()
     stopPlaybackSync()
     syncOverlayFrame(videoRef.current?.currentTime ?? 0)
+    syncOverlayVideoTime(videoRef.current?.currentTime ?? 0)
   }
 
   const dashboardClass = [
@@ -1678,10 +1724,7 @@ function App() {
                               onClick={() => setShowOverlayLayer((v) => !v)}
                               title={showOverlayLayer ? 'Hide overlay' : 'Show overlay'}
                               aria-pressed={showOverlayLayer}
-                              disabled={
-                                !selectedSession.media.overlayTransparentUrl &&
-                                !selectedSession.media.overlayFrameUrlTemplate
-                              }
+                              disabled={!hasOverlayMedia}
                             >
                               <span className="match-layer__eye" aria-hidden>
                                 {showOverlayLayer ? <IconEye size={16} /> : <IconEyeOff size={16} />}
@@ -1816,7 +1859,20 @@ function App() {
                             </>
                           ) : (
                             <>
-                              {overlayFrameUrl ? (
+                              {overlayVideoUrl ? (
+                                <video
+                                  key={`${selectedSession.id}-${selectedSession.updatedAt}-overlay-video`}
+                                  className="stage-overlay"
+                                  ref={overlayVideoRef}
+                                  src={overlayVideoUrl}
+                                  preload="auto"
+                                  playsInline
+                                  muted
+                                  style={{
+                                    opacity: overlayOpacityRendered,
+                                  }}
+                                />
+                              ) : overlayFrameUrl ? (
                                 <img
                                   alt=""
                                   className="stage-overlay"
@@ -1948,8 +2004,7 @@ function App() {
                             isFieldMode ||
                             !showVideoLayer ||
                             !showOverlayLayer ||
-                            (!selectedSession.media.overlayTransparentUrl &&
-                              !selectedSession.media.overlayFrameUrlTemplate)
+                            !hasOverlayMedia
                           }
                           aria-label="Overlay opacity"
                         />
@@ -2137,6 +2192,10 @@ function App() {
               {selectedSession?.overlay ? (
                 <div className="stat-grid stat-grid--single">
                   <div className="stat-cell">
+                    <span>Backend</span>
+                    <strong>{selectedSession.overlay.stats.backend ?? 'cpu'}</strong>
+                  </div>
+                  <div className="stat-cell">
                     <span>Max</span>
                     <strong>{selectedSession.overlay.stats.maxValue}</strong>
                   </div>
@@ -2151,6 +2210,18 @@ function App() {
                   <div className="stat-cell">
                     <span>Non-zero px</span>
                     <strong>{selectedSession.overlay.stats.nonZeroPixels.toLocaleString()}</strong>
+                  </div>
+                  <div className="stat-cell">
+                    <span>Budget hits</span>
+                    <strong>{selectedSession.overlay.stats.detectorBudgetHits ?? 0}</strong>
+                  </div>
+                  <div className="stat-cell">
+                    <span>Total time</span>
+                    <strong>
+                      {selectedSession.overlay.stats.timings?.total != null
+                        ? `${selectedSession.overlay.stats.timings.total.toFixed(1)}s`
+                        : '—'}
+                    </strong>
                   </div>
                 </div>
               ) : (

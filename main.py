@@ -54,14 +54,14 @@ def process_raw_data():
     color_array = create_color_array(raw_data, max_value, average_of_non_zero_values, average_display_color)
 
     print("Creating image...")
-    img = Image.fromarray(color_array, mode="RGB")
+    img = Image.fromarray(color_array)
     img.save(os.path.join(processed_folder_path, "processed_image.png"))
     print("Image saved.")
 
     print("Creating transparent image...")
     alpha_channel = np.where(np.any(color_array != 0, axis=2), 128, 0).astype(np.uint8)
     transparent_image = np.dstack((color_array, alpha_channel))
-    img = Image.fromarray(transparent_image, mode="RGBA")
+    img = Image.fromarray(transparent_image)
     img.save(os.path.join(processed_folder_path, "processed_image_transparent.png"))
     print("Transparent image saved.")
 
