@@ -191,6 +191,69 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(sorted(second), [(10, 10), (30, 30)])
         self.assertEqual(sorted(third), [(10, 10), (30, 30)])
 
+    def test_temporal_stabilizer_smooths_motion_and_predicts_short_dropout(self):
+        stabilizer = processor_cli.FuelTemporalStabilizer(
+            max_misses=2,
+            history_size=4,
+            min_baseline_count=999,
+            smoothing_alpha=0.5,
+            velocity_alpha=0.5,
+            velocity_decay=0.5,
+        )
+
+        first, bad_first = stabilizer.stabilize([(10, 10)])
+        second, bad_second = stabilizer.stabilize([(20, 10)])
+        third, bad_third = stabilizer.stabilize([])
+
+        self.assertFalse(bad_first)
+        self.assertFalse(bad_second)
+        self.assertFalse(bad_third)
+        self.assertEqual(first, [(10, 10)])
+        self.assertEqual(second, [(15, 10)])
+        self.assertEqual(third, [(20, 10)])
+
+    def test_temporal_stabilizer_updates_multiple_tracks_without_type_errors(self):
+        stabilizer = processor_cli.FuelTemporalStabilizer(
+            max_misses=2,
+            history_size=4,
+            min_baseline_count=999,
+            smoothing_alpha=0.5,
+            velocity_alpha=0.5,
+            velocity_decay=0.5,
+        )
+
+        first, bad_first = stabilizer.stabilize([(10, 10), (30, 30), (50, 50)])
+        second, bad_second = stabilizer.stabilize([(12, 10), (28, 30), (52, 50)])
+        third, bad_third = stabilizer.stabilize([(14, 10), (26, 30), (54, 50)])
+
+        self.assertFalse(bad_first)
+        self.assertFalse(bad_second)
+        self.assertFalse(bad_third)
+        self.assertEqual(first, [(10, 10), (30, 30), (50, 50)])
+        self.assertEqual(second, [(11, 10), (29, 30), (51, 50)])
+        self.assertEqual(len(third), 3)
+        self.assertTrue(all(isinstance(x, int) and isinstance(y, int) for x, y in third))
+        self.assertTrue(any(x >= 12 and y == 10 for x, y in third))
+        self.assertTrue(any(x <= 27 and y == 30 for x, y in third))
+        self.assertTrue(any(x >= 52 and y == 50 for x, y in third))
+
+    def test_temporal_stabilizer_ignores_malformed_centers(self):
+        stabilizer = processor_cli.FuelTemporalStabilizer(
+            max_misses=2,
+            history_size=4,
+            min_baseline_count=999,
+        )
+
+        first, bad_first = stabilizer.stabilize([(10, 10), (30, 30)])
+        second, bad_second = stabilizer.stabilize([(12, 10), (stabilizer, 30), (32, 30), ("bad", 5)])
+
+        self.assertFalse(bad_first)
+        self.assertFalse(bad_second)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertTrue(any(x >= 10 and y == 10 for x, y in second))
+        self.assertTrue(any(x >= 30 and y == 30 for x, y in second))
+
     def test_temporal_stabilizer_reuses_previous_centers_on_bad_count_frame(self):
         stabilizer = processor_cli.FuelTemporalStabilizer(
             history_size=4,
@@ -228,6 +291,62 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(saturated)
         self.assertLessEqual(len(centers), 5)
         self.assertGreater(len(centers), 0)
+
+    def test_hybrid_detector_falls_back_to_legacy_when_peak_detector_misses(self):
+        mask = np.zeros((80, 80), dtype=np.uint8)
+        mask[40, 40] = 255
+
+        peak = processor_cli.ball_centers_from_mask(mask, detector_mode="peak")
+        hybrid = processor_cli.ball_centers_from_mask(mask, detector_mode="hybrid")
+        legacy = processor_cli.ball_centers_from_mask(mask, detector_mode="legacy")
+
+        self.assertEqual(peak, [])
+        self.assertEqual(hybrid, legacy)
+        self.assertEqual(hybrid, [(40, 40)])
+
+    def test_legacy_detector_splits_dense_merged_blob_into_multiple_centers(self):
+        mask = np.zeros((140, 140), dtype=np.uint8)
+        points = [
+            (50, 70),
+            (60, 70),
+            (70, 70),
+            (80, 70),
+            (90, 70),
+            (55, 80),
+            (65, 80),
+            (75, 80),
+            (85, 80),
+        ]
+        for point in points:
+            cv2.circle(mask, point, 7, 255, -1)
+
+        legacy = processor_cli.ball_centers_from_mask(mask, detector_mode="legacy")
+
+        self.assertGreaterEqual(len(legacy), 8)
+
+    def test_hybrid_detector_prefers_richer_split_for_dense_merged_blob(self):
+        mask = np.zeros((140, 140), dtype=np.uint8)
+        points = [
+            (50, 70),
+            (60, 70),
+            (70, 70),
+            (80, 70),
+            (90, 70),
+            (55, 80),
+            (65, 80),
+            (75, 80),
+            (85, 80),
+        ]
+        for point in points:
+            cv2.circle(mask, point, 7, 255, -1)
+
+        peak = processor_cli.ball_centers_from_mask(mask, detector_mode="peak")
+        hybrid = processor_cli.ball_centers_from_mask(mask, detector_mode="hybrid")
+        legacy = processor_cli.ball_centers_from_mask(mask, detector_mode="legacy")
+
+        self.assertEqual(len(peak), 1)
+        self.assertEqual(hybrid, legacy)
+        self.assertGreaterEqual(len(hybrid), 8)
 
     def test_temporal_stabilizer_caps_active_tracks(self):
         stabilizer = processor_cli.FuelTemporalStabilizer(

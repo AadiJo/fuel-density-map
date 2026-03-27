@@ -69,6 +69,9 @@ OVERLAY_FUEL_DOT_RADIUS_PX = 5
 
 FUEL_TRACK_MATCH_RADIUS_PX = 14.0
 FUEL_TRACK_MAX_MISSES = 2
+FUEL_TRACK_SMOOTHING_ALPHA = 0.45
+FUEL_TRACK_VELOCITY_ALPHA = 0.35
+FUEL_TRACK_VELOCITY_DECAY = 0.7
 BAD_FRAME_HISTORY_SIZE = 6
 BAD_FRAME_MIN_BASELINE_COUNT = 6
 BAD_FRAME_MIN_COUNT_DELTA = 8
@@ -454,22 +457,50 @@ def _dt_peaks_in_component(component_mask, budget, min_sep):
         return []
 
     dil = cv2.dilate(dist, np.ones((3, 3), np.uint8))
-    lm = np.isclose(dist, dil, rtol=0, atol=1e-3) & (dist >= 0.5) & (component_mask > 0)
-    ys, xs = np.where(lm)
-    if len(xs) == 0:
+    lm = (np.isclose(dist, dil, rtol=0, atol=1e-3) & (dist >= 0.5) & (component_mask > 0)).astype(np.uint8)
+    n_labels, labels, _, centroids = cv2.connectedComponentsWithStats(lm)
+    if n_labels <= 1:
         return []
 
-    strengths = dist[lm]
-    order = np.argsort(-strengths)
+    candidates = []
+    for label_idx in range(1, n_labels):
+        ys, xs = np.where(labels == label_idx)
+        if len(xs) == 0:
+            continue
+        strengths = dist[ys, xs]
+        peak_idx = int(np.argmax(strengths))
+        peak_strength = float(strengths[peak_idx])
+        centroid_x, centroid_y = centroids[label_idx]
+        px = float(xs[peak_idx])
+        py = float(ys[peak_idx])
+        # For narrow plateaus, the connected-component centroid is more stable than any one pixel.
+        if len(xs) > 1:
+            px = float(centroid_x)
+            py = float(centroid_y)
+        candidates.append((peak_strength, px, py))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: -item[0])
     sep2 = min_sep * min_sep
     peaks = []
-    for idx in order:
+    for _strength, px, py in candidates:
         if len(peaks) >= budget:
             break
-        py, px = int(ys[idx]), int(xs[idx])
         if all((px - ux) ** 2 + (py - uy) ** 2 >= sep2 for ux, uy in peaks):
             peaks.append((px, py))
     return peaks
+
+
+def _should_prefer_legacy_split(peak_centers, legacy_centers):
+    peak_count = len(peak_centers)
+    legacy_count = len(legacy_centers)
+    if legacy_count <= 0:
+        return False
+    if peak_count <= 0:
+        return True
+    return legacy_count >= max(peak_count + 2, int(math.ceil(peak_count * 1.5)))
 
 
 def legacy_ball_centers_from_mask(mask_binary, max_centers=LEGACY_MAX_CENTERS):
@@ -484,8 +515,8 @@ def legacy_ball_centers_from_mask(mask_binary, max_centers=LEGACY_MAX_CENTERS):
     areas = np.array([stats[i, cv2.CC_STAT_AREA] for i in range(1, n_labels)])
     sorted_areas = np.sort(areas)
     bottom_n = max(1, len(sorted_areas) * 40 // 100)
-    single_ball_area = float(np.clip(np.median(sorted_areas[:bottom_n]), 6, 200))
-    min_sep = max(1.5, np.sqrt(single_ball_area) * 0.35)
+    single_ball_area = float(np.clip(np.median(sorted_areas[:bottom_n]), 6, 240))
+    min_sep = max(1.5, np.sqrt(single_ball_area) * 0.28)
 
     centers = []
     saturated = False
@@ -496,14 +527,16 @@ def legacy_ball_centers_from_mask(mask_binary, max_centers=LEGACY_MAX_CENTERS):
 
         area = stats[i, cv2.CC_STAT_AREA]
         cx, cy = centroids[i]
-        estimated_balls = max(1, round(area / single_ball_area))
+        component_mask = (labels == i).astype(np.uint8) * 255
+        peak_candidates = _dt_peaks_in_component(component_mask, max_centers, min_sep)
+        estimated_from_area = max(1, round(area / single_ball_area))
+        estimated_balls = max(estimated_from_area, len(peak_candidates))
 
         if estimated_balls == 1:
             centers.append((int(cx), int(cy)))
             continue
 
-        component_mask = (labels == i).astype(np.uint8) * 255
-        peaks = _dt_peaks_in_component(component_mask, estimated_balls, min_sep)
+        peaks = peak_candidates[:estimated_balls]
 
         if peaks:
             centers.extend(peaks)
@@ -535,19 +568,26 @@ def ball_centers_from_mask(
     max_centers=None,
     working_scale=DEFAULT_WORKING_SCALE,
     detector_budget=None,
-    detector_mode="legacy",
+    detector_mode="hybrid",
 ):
-    if detector_mode == "peak":
+    if detector_mode in {"peak", "hybrid"}:
         detector = PeakBallDetector(working_scale=working_scale, detector_budget=detector_budget)
-        centers, _ = detector.detect(mask_binary)
+        peak_centers, _ = detector.detect(mask_binary)
+        if detector_mode == "peak":
+            if max_centers is not None:
+                return peak_centers[: int(max_centers)]
+            return peak_centers
+        legacy_centers, _ = legacy_ball_centers_from_mask(
+            mask_binary,
+            max_centers=int(max_centers or LEGACY_MAX_CENTERS),
+        )
+        if _should_prefer_legacy_split(peak_centers, legacy_centers):
+            return legacy_centers
         if max_centers is not None:
-            return centers[: int(max_centers)]
-        return centers
+            return peak_centers[: int(max_centers)]
+        return peak_centers
 
-    legacy_centers, _ = legacy_ball_centers_from_mask(
-        mask_binary,
-        max_centers=int(max_centers or LEGACY_MAX_CENTERS),
-    )
+    legacy_centers, _ = legacy_ball_centers_from_mask(mask_binary, max_centers=int(max_centers or LEGACY_MAX_CENTERS))
     return legacy_centers
 
 
@@ -565,6 +605,9 @@ class FuelTemporalStabilizer:
         max_active_tracks=DEFAULT_MAX_ACTIVE_TRACKS,
         max_track_age=DEFAULT_TRACK_MAX_AGE,
         dedupe_radius_px=None,
+        smoothing_alpha=FUEL_TRACK_SMOOTHING_ALPHA,
+        velocity_alpha=FUEL_TRACK_VELOCITY_ALPHA,
+        velocity_decay=FUEL_TRACK_VELOCITY_DECAY,
     ):
         self.match_radius = float(match_radius_px)
         self.match_radius_sq = self.match_radius * self.match_radius
@@ -579,6 +622,9 @@ class FuelTemporalStabilizer:
             self.dedupe_radius = 0.0
         else:
             self.dedupe_radius = max(0.0, float(dedupe_radius_px))
+        self.smoothing_alpha = float(np.clip(smoothing_alpha, 0.01, 1.0))
+        self.velocity_alpha = float(np.clip(velocity_alpha, 0.01, 1.0))
+        self.velocity_decay = float(np.clip(velocity_decay, 0.0, 1.0))
         self._next_track_id = 1
         self.tracks = []
 
@@ -597,16 +643,47 @@ class FuelTemporalStabilizer:
     def _current_centers(self):
         return [(int(track["x"]), int(track["y"])) for track in self.tracks]
 
+    def _make_track(self, center, age=0):
+        cx, cy = center
+        return {
+            "id": int(self._next_track_id),
+            "x": float(cx),
+            "y": float(cy),
+            "vx": 0.0,
+            "vy": 0.0,
+            "missed": 0,
+            "age": int(age),
+        }
+
+    def _predicted_position(self, track):
+        return (
+            float(track["x"]) + float(track.get("vx", 0.0)),
+            float(track["y"]) + float(track.get("vy", 0.0)),
+        )
+
     def _dedupe_centers(self, centers, radius):
         if not centers:
             return []
+        normalized = []
+        for center in centers:
+            try:
+                cx, cy = center
+                fx = float(cx)
+                fy = float(cy)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(fx) or not np.isfinite(fy):
+                continue
+            normalized.append((int(round(fx)), int(round(fy))))
+        if not normalized:
+            return []
         if radius <= 0:
-            return [(int(cx), int(cy)) for cx, cy in centers]
+            return normalized
         cell_size = max(1.0, float(radius))
         radius_sq = float(radius) * float(radius)
         grid = {}
         deduped = []
-        for cx, cy in centers:
+        for cx, cy in normalized:
             fx = float(cx)
             fy = float(cy)
             gx = int(fx // cell_size)
@@ -645,18 +722,18 @@ class FuelTemporalStabilizer:
     def _match_and_update_tracks(self, centers, saturated=False):
         deduped_centers = self._dedupe_centers(centers, self.dedupe_radius)
         if not self.tracks:
-            self.tracks = [
-                {"id": self._next_track_id + idx, "x": int(cx), "y": int(cy), "missed": 0, "age": 0}
-                for idx, (cx, cy) in enumerate(deduped_centers[: self.max_active_tracks])
-            ]
-            self._next_track_id += len(self.tracks)
+            self.tracks = []
+            for cx, cy in deduped_centers[: self.max_active_tracks]:
+                self.tracks.append(self._make_track((cx, cy)))
+                self._next_track_id += 1
             return
 
         cell_size = max(1.0, self.match_radius)
         track_grid = {}
         for track_index, track in enumerate(self.tracks):
-            gx = int(float(track["x"]) // cell_size)
-            gy = int(float(track["y"]) // cell_size)
+            pred_x, pred_y = self._predicted_position(track)
+            gx = int(pred_x // cell_size)
+            gy = int(pred_y // cell_size)
             track_grid.setdefault((gx, gy), []).append(track_index)
 
         unmatched_tracks = set(range(len(self.tracks)))
@@ -676,8 +753,9 @@ class FuelTemporalStabilizer:
                         if track_index in matched_tracks:
                             continue
                         track = self.tracks[track_index]
-                        dx = fx - float(track["x"])
-                        dy = fy - float(track["y"])
+                        pred_x, pred_y = self._predicted_position(track)
+                        dx = fx - pred_x
+                        dy = fy - pred_y
                         distance_sq = dx * dx + dy * dy
                         if distance_sq > self.match_radius_sq:
                             continue
@@ -687,11 +765,21 @@ class FuelTemporalStabilizer:
 
             if best_track_index is not None:
                 base_track = self.tracks[best_track_index]
+                prev_x = float(base_track["x"])
+                prev_y = float(base_track["y"])
+                measured_dx = fx - prev_x
+                measured_dy = fy - prev_y
+                vx = (1.0 - self.velocity_alpha) * float(base_track.get("vx", 0.0)) + self.velocity_alpha * measured_dx
+                vy = (1.0 - self.velocity_alpha) * float(base_track.get("vy", 0.0)) + self.velocity_alpha * measured_dy
+                next_x = prev_x + self.smoothing_alpha * measured_dx
+                next_y = prev_y + self.smoothing_alpha * measured_dy
                 next_tracks.append(
                     {
                         "id": int(base_track["id"]),
-                        "x": int(cx),
-                        "y": int(cy),
+                        "x": next_x,
+                        "y": next_y,
+                        "vx": vx,
+                        "vy": vy,
                         "missed": 0,
                         "age": int(base_track["age"]) + 1,
                     }
@@ -699,15 +787,7 @@ class FuelTemporalStabilizer:
                 unmatched_tracks.discard(best_track_index)
                 matched_tracks.add(best_track_index)
             elif len(next_tracks) < self.max_active_tracks:
-                next_tracks.append(
-                    {
-                        "id": int(self._next_track_id),
-                        "x": int(cx),
-                        "y": int(cy),
-                        "missed": 0,
-                        "age": 0,
-                    }
-                )
+                next_tracks.append(self._make_track((cx, cy)))
                 self._next_track_id += 1
 
         for track_index in unmatched_tracks:
@@ -716,11 +796,16 @@ class FuelTemporalStabilizer:
             age = int(track["age"]) + 1
             if missed > self.max_misses or age > self.max_track_age:
                 continue
+            next_x, next_y = self._predicted_position(track)
+            next_vx = float(track.get("vx", 0.0)) * self.velocity_decay
+            next_vy = float(track.get("vy", 0.0)) * self.velocity_decay
             next_tracks.append(
                 {
                     "id": int(track["id"]),
-                    "x": int(track["x"]),
-                    "y": int(track["y"]),
+                    "x": next_x,
+                    "y": next_y,
+                    "vx": next_vx,
+                    "vy": next_vy,
                     "missed": missed,
                     "age": age,
                 }
@@ -774,7 +859,7 @@ class FuelTemporalStabilizer:
         return kept
 
     def stabilize(self, centers, saturated=False):
-        raw_centers = self._dedupe_centers([(int(cx), int(cy)) for cx, cy in centers], self.dedupe_radius)
+        raw_centers = self._dedupe_centers(centers, self.dedupe_radius)
         raw_count = len(raw_centers)
 
         if self._is_bad_frame(raw_count):
@@ -796,7 +881,7 @@ class CpuFrameProcessor:
         field_quad,
         working_scale=DEFAULT_WORKING_SCALE,
         detector_budget=None,
-        detector_mode="legacy",
+        detector_mode="hybrid",
     ):
         self.bbox = bbox
         self.field_quad = field_quad
@@ -805,7 +890,7 @@ class CpuFrameProcessor:
         self.detector_budget = detector_budget
         self.working_scale = working_scale
         self.detector = None
-        if self.detector_mode == "peak":
+        if self.detector_mode in {"peak", "hybrid"}:
             self.detector = PeakBallDetector(
                 working_scale=working_scale,
                 detector_budget=detector_budget,
@@ -822,7 +907,14 @@ class CpuFrameProcessor:
         if mask is None or not np.any(mask):
             return [], False
         if self.detector_mode == "peak" and self.detector is not None:
-            return self.detector.detect(mask)
+            peak_centers, peak_saturated = self.detector.detect(mask)
+            return peak_centers, peak_saturated
+        if self.detector_mode == "hybrid" and self.detector is not None:
+            peak_centers, peak_saturated = self.detector.detect(mask)
+            legacy_centers, legacy_saturated = legacy_ball_centers_from_mask(mask, max_centers=LEGACY_MAX_CENTERS)
+            if _should_prefer_legacy_split(peak_centers, legacy_centers):
+                return legacy_centers, legacy_saturated
+            return peak_centers, peak_saturated
         return legacy_ball_centers_from_mask(mask, max_centers=LEGACY_MAX_CENTERS)
 
 
@@ -835,7 +927,7 @@ class CudaFrameProcessor(CpuFrameProcessor):
         field_quad,
         working_scale=DEFAULT_WORKING_SCALE,
         detector_budget=None,
-        detector_mode="legacy",
+        detector_mode="hybrid",
     ):
         if not cuda_backend_available():
             raise RuntimeError(
@@ -1197,7 +1289,7 @@ def create_live_overlay_frame(frame, bbox, field_quad, overlay_color):
     mask = roi_yellow_mask_binary(frame, bbox, field_quad)
     if mask is None or not np.any(mask):
         return np.zeros((h, w, 3), dtype=np.uint8)
-    centers = ball_centers_from_mask(mask, detector_mode="legacy")
+    centers = ball_centers_from_mask(mask, detector_mode="hybrid")
     return draw_fuel_dots_full_frame(h, w, bbox, centers, overlay_color)
 
 
@@ -1219,7 +1311,7 @@ def write_dynamic_assets(
     working_scale=DEFAULT_WORKING_SCALE,
     detector_budget=None,
     max_active_tracks=DEFAULT_MAX_ACTIVE_TRACKS,
-    detector_mode="legacy",
+    detector_mode="hybrid",
 ):
     metadata = probe_video_metadata(video_path)
     fps = metadata["fps"]
@@ -1383,7 +1475,7 @@ def main():
     parser.add_argument("--working-scale", type=float, default=DEFAULT_WORKING_SCALE)
     parser.add_argument("--detector-budget", type=int, default=0)
     parser.add_argument("--max-active-tracks", type=int, default=DEFAULT_MAX_ACTIVE_TRACKS)
-    parser.add_argument("--detector-mode", choices=("legacy", "peak"), default="legacy")
+    parser.add_argument("--detector-mode", choices=("legacy", "peak", "hybrid"), default="hybrid")
     args = parser.parse_args()
 
     bbox = parse_bbox(args.bbox)

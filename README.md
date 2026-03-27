@@ -69,5 +69,5 @@ bun run start
 
 - The YouTube import flow uses `yt-dlp` through Python, installed from `requirements.txt`
 - The processing pipeline still uses OpenCV, NumPy, and Pillow
-- `processor_cli.py` now supports `--backend cpu|cuda`, `--overlay-output video|frames`, `--working-scale`, `--detector-budget`, and `--max-active-tracks`
+- `processor_cli.py` now supports `--backend cpu|cuda`, `--overlay-output video|frames`, `--working-scale`, `--detector-budget`, `--max-active-tracks`, and `--detector-mode legacy|peak|hybrid`
 - `benchmark_processor.py` can benchmark the processor against a local clip and print per-stage timings from `stats.json`

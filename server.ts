@@ -803,7 +803,7 @@ async function processSession(sessionId: string) {
     const workingScaleArg = Bun.env.PROCESSOR_WORKING_SCALE
     const detectorBudgetArg = Bun.env.PROCESSOR_DETECTOR_BUDGET
     const maxActiveTracksArg = Bun.env.PROCESSOR_MAX_ACTIVE_TRACKS
-    const detectorModeArg = Bun.env.PROCESSOR_DETECTOR_MODE ?? 'legacy'
+    const detectorModeArg = Bun.env.PROCESSOR_DETECTOR_MODE ?? 'hybrid'
     await rm(path.join(sessionDir(sessionId), 'overlay-video.mp4'), { force: true })
     await rm(path.join(sessionDir(sessionId), 'overlay-frames'), { recursive: true, force: true })
     const { stdout, stderr } = await runProcessorWithProgress(
