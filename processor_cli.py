@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+from collections import deque
 
 import cv2
 import numpy as np
@@ -16,6 +17,7 @@ DEFAULT_FIELD_IMAGE_PATH = os.path.join(
     "assets",
     "rebuilt-field.png",
 )
+DEFAULT_TARGET_PROCESS_FPS = 15.0
 
 PROGRESS_PREFIX = "PROGRESS_JSON:"
 
@@ -28,18 +30,11 @@ def emit_progress(phase, current, total):
 
 
 def compute_total_work_units(video_path):
-    """Two full passes: accumulate analysis + per-frame overlay/field export."""
+    """Single sampled pass over the source video."""
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    if fps <= 0:
-        fps = 30.0
     frame_count_cap = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    end_time = frame_count_cap / fps if fps > 0 else 0
-    end_frame = int(end_time * fps)
-    start_frame = int(0 * fps)
-    analyze_total = max(1, end_frame - start_frame)
     cap.release()
-    return max(1, analyze_total * 2)
+    return max(1, frame_count_cap)
 
 
 FIELD_DESTINATION_BOUNDS = {
@@ -269,8 +264,20 @@ FIELD_MAP_FUEL_RADIUS = 10
 
 OVERLAY_FUEL_DOT_RADIUS_PX = 5
 
-# Export every Nth source frame (2 = half the work and half the files; stats fps is scaled so UI stays in sync).
-OVERLAY_FRAME_STRIDE = 2
+FUEL_TRACK_MATCH_RADIUS_PX = 14.0
+FUEL_TRACK_MAX_MISSES = 2
+BAD_FRAME_HISTORY_SIZE = 6
+BAD_FRAME_MIN_BASELINE_COUNT = 6
+BAD_FRAME_MIN_COUNT_DELTA = 8
+BAD_FRAME_COUNT_DELTA_RATIO = 0.45
+
+
+def compute_frame_stride(source_fps, target_fps):
+    if source_fps <= 0:
+        source_fps = 30.0
+    if target_fps is None or target_fps <= 0 or target_fps >= source_fps:
+        return 1
+    return max(1, int(round(float(source_fps) / float(target_fps))))
 
 
 def draw_fuel_dots_full_frame(height, width, bbox, centers, overlay_color):
@@ -284,6 +291,91 @@ def draw_fuel_dots_full_frame(height, width, bbox, centers, overlay_color):
     for cx, cy in centers:
         cv2.circle(out, (int(x0 + cx), int(y0 + cy)), dot_r, color, -1, lineType=cv2.LINE_8)
     return out
+
+
+class FuelTemporalStabilizer:
+    """Hold stationary fuel through brief dropouts and reject obvious count-spike frames."""
+
+    def __init__(
+        self,
+        match_radius_px=FUEL_TRACK_MATCH_RADIUS_PX,
+        max_misses=FUEL_TRACK_MAX_MISSES,
+        history_size=BAD_FRAME_HISTORY_SIZE,
+        min_baseline_count=BAD_FRAME_MIN_BASELINE_COUNT,
+        min_count_delta=BAD_FRAME_MIN_COUNT_DELTA,
+        count_delta_ratio=BAD_FRAME_COUNT_DELTA_RATIO,
+    ):
+        self.match_radius_sq = float(match_radius_px) * float(match_radius_px)
+        self.max_misses = int(max_misses)
+        self.min_baseline_count = int(min_baseline_count)
+        self.min_count_delta = int(min_count_delta)
+        self.count_delta_ratio = float(count_delta_ratio)
+        self.count_history = deque(maxlen=max(1, int(history_size)))
+        self.tracks = []
+
+    def _baseline_count(self):
+        if not self.count_history:
+            return None
+        return float(np.median(np.array(self.count_history, dtype=np.float32)))
+
+    def _is_bad_frame(self, raw_count):
+        baseline = self._baseline_count()
+        if baseline is None or baseline < self.min_baseline_count:
+            return False
+        allowed_delta = max(self.min_count_delta, int(round(baseline * self.count_delta_ratio)))
+        return abs(int(raw_count) - int(round(baseline))) >= allowed_delta
+
+    def _current_centers(self):
+        return [(int(track["x"]), int(track["y"])) for track in self.tracks]
+
+    def _match_and_update_tracks(self, centers):
+        if not self.tracks:
+            self.tracks = [{"x": int(cx), "y": int(cy), "missed": 0} for cx, cy in centers]
+            return
+
+        unmatched_tracks = set(range(len(self.tracks)))
+        unmatched_centers = set(range(len(centers)))
+        matches = []
+        for center_index, (cx, cy) in enumerate(centers):
+            for track_index, track in enumerate(self.tracks):
+                dx = float(cx) - float(track["x"])
+                dy = float(cy) - float(track["y"])
+                dist_sq = dx * dx + dy * dy
+                if dist_sq <= self.match_radius_sq:
+                    matches.append((dist_sq, track_index, center_index))
+        matches.sort(key=lambda item: item[0])
+
+        next_tracks = [None] * len(self.tracks)
+        for _, track_index, center_index in matches:
+            if track_index not in unmatched_tracks or center_index not in unmatched_centers:
+                continue
+            cx, cy = centers[center_index]
+            next_tracks[track_index] = {"x": int(cx), "y": int(cy), "missed": 0}
+            unmatched_tracks.remove(track_index)
+            unmatched_centers.remove(center_index)
+
+        for track_index in unmatched_tracks:
+            track = self.tracks[track_index]
+            missed = int(track["missed"]) + 1
+            if missed <= self.max_misses:
+                next_tracks[track_index] = {"x": track["x"], "y": track["y"], "missed": missed}
+
+        self.tracks = [track for track in next_tracks if track is not None]
+        for center_index in sorted(unmatched_centers):
+            cx, cy = centers[center_index]
+            self.tracks.append({"x": int(cx), "y": int(cy), "missed": 0})
+
+    def stabilize(self, centers):
+        raw_centers = [(int(cx), int(cy)) for cx, cy in centers]
+        raw_count = len(raw_centers)
+
+        if self._is_bad_frame(raw_count):
+            return self._current_centers(), True
+
+        self._match_and_update_tracks(raw_centers)
+        stabilized = self._current_centers()
+        self.count_history.append(len(stabilized))
+        return stabilized, False
 
 
 def create_live_overlay_frame(frame, bbox, field_quad, overlay_color):
@@ -349,10 +441,12 @@ def write_dynamic_assets(
     video_path,
     overlay_frames_dir,
     field_map_path,
+    raw_data_path,
     bbox,
     field_quad,
     average_display_color,
     field_image_path,
+    target_process_fps=DEFAULT_TARGET_PROCESS_FPS,
     progress_callback=None,
     progress_total_frames=None,
     progress_offset=0,
@@ -368,6 +462,9 @@ def write_dynamic_assets(
     if bbox is None:
         cap.release()
         raise RuntimeError("Bounding box is outside the video frame.")
+    x, y, width, height = bbox
+    raw_data = np.zeros((frame_height, frame_width), dtype=np.uint32)
+    raw_data_view = raw_data[y : y + height, x : x + width]
 
     field_image = Image.open(field_image_path).convert("RGB")
     field_width, field_height = field_image.size
@@ -390,45 +487,61 @@ def write_dynamic_assets(
     total_frames = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
     progress_stride = max(1, total_frames // 150)
     roi_quad_mask = precompute_roi_quad_mask(bbox, field_quad)
-    stride = max(1, int(OVERLAY_FRAME_STRIDE))
+    stride = compute_frame_stride(fps, target_process_fps)
     export_fps = float(fps) / float(stride)
+    temporal_stabilizer = FuelTemporalStabilizer()
+    sample_weight = np.uint32(stride)
+
+    print(f"Video FPS: {fps}")
+    print(f"Target processing FPS: {target_process_fps}")
+    print(f"Frame stride: {stride}")
+    print(f"Effective exported FPS: {export_fps}")
 
     if progress_callback and progress_total_frames is not None:
         progress_callback(progress_offset, progress_total_frames)
 
     video_read_count = 0
-    while True:
-        ret, frame = cap.read()
+    while video_read_count < total_frames:
+        should_process = (video_read_count % stride) == 0
+        if should_process:
+            ret, frame = cap.read()
+        else:
+            ret = cap.grab()
+            frame = None
         if not ret:
             break
-        video_read_count += 1
 
         if progress_callback and progress_total_frames is not None:
             if (
-                video_read_count == 1
+                video_read_count == 0
                 or video_read_count % progress_stride == 0
-                or video_read_count >= total_frames
+                or video_read_count + 1 >= total_frames
             ):
-                progress_callback(progress_offset + video_read_count, progress_total_frames)
+                progress_callback(progress_offset + video_read_count + 1, progress_total_frames)
 
-        if (video_read_count - 1) % stride != 0:
+        if not should_process:
+            video_read_count += 1
             continue
+
+        if video_read_count == 0 or video_read_count % max(int(export_fps), 1) == 0:
+            print(f"Processing sampled frame {video_read_count}/{total_frames}", end="\r")
+
+        raw_data_view += analysis.yellow_pixel_mask(frame[y : y + height, x : x + width]).astype(np.uint32) * sample_weight
 
         # Single mask + center pass per frame (create_live_overlay + project_fuel duplicated this).
         mask = roi_yellow_mask_binary(frame, bbox, field_quad, quad_mask_roi=roi_quad_mask)
-        if mask is None or not np.any(mask):
-            live_overlay = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-            field_frames.append([])
-        else:
+        centers = []
+        if mask is not None and np.any(mask):
             centers = ball_centers_from_mask(mask)
-            live_overlay = draw_fuel_dots_full_frame(
-                frame_height, frame_width, bbox, centers, average_display_color
+        stable_centers, _bad_frame = temporal_stabilizer.stabilize(centers)
+        live_overlay = draw_fuel_dots_full_frame(
+            frame_height, frame_width, bbox, stable_centers, average_display_color
+        )
+        field_frames.append(
+            project_fuel_points_from_centers(
+                stable_centers, bbox, projection_matrix, field_width, field_height
             )
-            field_frames.append(
-                project_fuel_points_from_centers(
-                    centers, bbox, projection_matrix, field_width, field_height
-                )
-            )
+        )
 
         success, encoded = cv2.imencode(
             ".webp",
@@ -442,8 +555,13 @@ def write_dynamic_assets(
         frame_path = os.path.join(overlay_frames_dir, f"frame_{frame_count:06d}.webp")
         encoded.tofile(frame_path)
         frame_count += 1
+        video_read_count += 1
 
     cap.release()
+    print()
+
+    print("Saving raw data...")
+    np.savetxt(raw_data_path, raw_data, fmt="%d")
 
     with open(field_map_path, "w", encoding="utf-8") as handle:
         json.dump(
@@ -459,6 +577,7 @@ def write_dynamic_assets(
         )
 
     return {
+        "raw_data": raw_data,
         "fps": export_fps,
         "frameCount": frame_count,
     }
@@ -472,6 +591,7 @@ def main():
     parser.add_argument("--quad", help="Field quad in x1,y1,x2,y2,x3,y3,x4,y4 pixels")
     parser.add_argument("--average-display-color", default="255,0,255", help="RGB color for the average intensity point")
     parser.add_argument("--pct-from-average-to-max", type=float, default=0.5)
+    parser.add_argument("--target-process-fps", type=float, default=DEFAULT_TARGET_PROCESS_FPS)
     parser.add_argument("--field-image", default=DEFAULT_FIELD_IMAGE_PATH, help="Top-down field asset for field-map projection")
     args = parser.parse_args()
 
@@ -480,20 +600,7 @@ def main():
     average_display_color = tuple(int(part.strip()) for part in args.average_display_color.split(","))
 
     total_work = compute_total_work_units(args.video)
-    analyze_half = max(1, total_work // 2)
-    emit_progress("analyze", 0, total_work)
-
-    def on_analyze_progress(processed, phase_total):
-        emit_progress("analyze", min(processed, analyze_half), total_work)
-
-    print("Analyzing video...")
-    raw_data = analysis.get_total_yellow_pixels_from_video(
-        args.video,
-        bbox=bbox,
-        progress_callback=on_analyze_progress,
-    )
-
-    emit_progress("encode", analyze_half, total_work)
+    emit_progress("frames", 0, total_work)
 
     os.makedirs(args.session_dir, exist_ok=True)
 
@@ -504,8 +611,23 @@ def main():
     field_map_path = os.path.join(args.session_dir, "field-map.json")
     stats_path = os.path.join(args.session_dir, "stats.json")
 
-    print("Saving raw data...")
-    np.savetxt(raw_data_path, raw_data, fmt="%d")
+    print("Processing video...")
+    overlay_timing = write_dynamic_assets(
+        args.video,
+        overlay_frames_dir,
+        field_map_path,
+        raw_data_path,
+        bbox,
+        field_quad,
+        average_display_color,
+        args.field_image,
+        target_process_fps=args.target_process_fps,
+        progress_callback=lambda processed, total: emit_progress("frames", min(processed, total_work), total_work),
+        progress_total_frames=total_work,
+    )
+    raw_data = overlay_timing.pop("raw_data")
+
+    emit_progress("encode", total_work, total_work)
 
     max_value = int(raw_data.max())
     non_zero_values = raw_data[raw_data > 0]
@@ -519,26 +641,6 @@ def main():
     alpha_channel = np.where(np.any(color_array != 0, axis=2), 220, 0).astype(np.uint8)
     transparent_image = np.dstack((color_array, alpha_channel))
     Image.fromarray(transparent_image, mode="RGBA").save(transparent_overlay_path)
-
-    emit_progress("encode", analyze_half, total_work)
-
-    print("Creating overlay frames...")
-
-    def on_frames_progress(global_current, total_work_units):
-        emit_progress("frames", min(global_current, total_work_units), total_work_units)
-
-    overlay_timing = write_dynamic_assets(
-        args.video,
-        overlay_frames_dir,
-        field_map_path,
-        bbox,
-        field_quad,
-        average_display_color,
-        args.field_image,
-        progress_callback=on_frames_progress,
-        progress_total_frames=total_work,
-        progress_offset=analyze_half,
-    )
 
     stats = {
         "bbox": {
