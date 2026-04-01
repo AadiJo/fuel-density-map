@@ -1,4 +1,5 @@
 import unittest
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -152,6 +153,21 @@ class AnalysisTests(unittest.TestCase):
 
         np.testing.assert_array_equal(actual, expected)
 
+    def test_fuel_pixel_mask_hsv_relaxes_saturation_floor_for_pale_picked_color(self):
+        pale_yellow_bgr = np.array([[[210, 230, 230]]], dtype=np.uint8)
+
+        default_mask = analysis.fuel_pixel_mask_hsv(
+            pale_yellow_bgr,
+            base_color_rgb=analysis.DEFAULT_FUEL_BASE_COLOR_RGB,
+        )
+        picked_mask = analysis.fuel_pixel_mask_hsv(
+            pale_yellow_bgr,
+            base_color_rgb=(230, 230, 210),
+        )
+
+        self.assertEqual(int(default_mask[0, 0]), 0)
+        self.assertEqual(int(picked_mask[0, 0]), 255)
+
     def test_projected_points_inside_side_hexes_are_excluded(self):
         field_width = 3901
         field_height = 1583
@@ -176,6 +192,35 @@ class AnalysisTests(unittest.TestCase):
             processor_cli.FIELD_MAP_FUEL_RADIUS,
         ]
         self.assertEqual(points, [expected_open_field])
+
+    def test_synchronized_field_and_air_points_stay_aligned_after_field_exclusion(self):
+        field_width = 3901
+        field_height = 1583
+        bbox = (0, 0, 1, 1)
+        projection_matrix = np.eye(3, dtype=np.float32)
+        wall_projection_matrix = np.eye(3, dtype=np.float32)
+        mask = np.ones((field_height + 10, field_width + 10), dtype=np.uint8) * 255
+
+        inside_left_hex = (int(round(field_width * 0.3139)), int(round(field_height * 0.4991)))
+        open_field = (int(round(field_width * 0.5)), int(round(field_height * 0.5)))
+
+        field_points, air_points = processor_cli.project_synchronized_field_and_air_points(
+            [inside_left_hex, open_field],
+            bbox=bbox,
+            field_projection_matrix=projection_matrix,
+            field_width=field_width,
+            field_height=field_height,
+            mask_binary=mask,
+            wall_projection_matrix=wall_projection_matrix,
+            wall_side="top",
+        )
+
+        self.assertEqual(len(field_points), 1)
+        self.assertEqual(len(air_points), 1)
+        self.assertEqual(field_points[0][:2], [
+            int(round((open_field[0] / field_width) * 10000)),
+            int(round((open_field[1] / field_height) * 10000)),
+        ])
 
     def test_temporal_stabilizer_holds_stationary_fuel_through_short_dropout(self):
         stabilizer = processor_cli.FuelTemporalStabilizer(max_misses=2, history_size=4)
@@ -254,6 +299,22 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(any(x >= 10 and y == 10 for x, y in second))
         self.assertTrue(any(x >= 30 and y == 30 for x, y in second))
 
+    def test_temporal_stabilizer_skips_corrupted_track_state(self):
+        stabilizer = processor_cli.FuelTemporalStabilizer(
+            max_misses=2,
+            history_size=4,
+            min_baseline_count=999,
+        )
+
+        stabilizer.stabilize([(10, 10), (30, 30)])
+        stabilizer.tracks[0]["x"] = stabilizer
+
+        stable, bad = stabilizer.stabilize([(12, 10), (32, 30)])
+
+        self.assertFalse(bad)
+        self.assertTrue(all(isinstance(x, int) and isinstance(y, int) for x, y in stable))
+        self.assertTrue(any(x >= 30 and y == 30 for x, y in stable))
+
     def test_temporal_stabilizer_reuses_previous_centers_on_bad_count_frame(self):
         stabilizer = processor_cli.FuelTemporalStabilizer(
             history_size=4,
@@ -278,6 +339,190 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(processor_cli.compute_frame_stride(30.0, 15.0), 2)
         self.assertEqual(processor_cli.compute_frame_stride(24.714, 15.0), 2)
         self.assertEqual(processor_cli.compute_frame_stride(14.0, 15.0), 1)
+
+    def test_infer_wall_side_matches_right_edge(self):
+        field_quad = np.array(
+            [
+                [0.0, 0.0],
+                [100.0, 0.0],
+                [100.0, 100.0],
+                [0.0, 100.0],
+            ],
+            dtype=np.float32,
+        )
+        wall_quad = np.array(
+            [
+                [82.0, 15.0],
+                [98.0, 20.0],
+                [98.0, 98.0],
+                [83.0, 80.0],
+            ],
+            dtype=np.float32,
+        )
+
+        self.assertEqual(processor_cli.infer_wall_side(field_quad, wall_quad), "right")
+
+    def test_air_profile_uses_ball_bottom_for_ground_classification(self):
+        mask = np.zeros((100, 100), dtype=np.uint8)
+        cv2.circle(mask, (30, 85), 10, 255, -1)
+
+        frame = processor_cli.build_air_profile_frame(
+            [(30, 85)],
+            bbox=(0, 0, 100, 100),
+            mask_binary=mask,
+            field_projection_matrix=np.eye(3, dtype=np.float32),
+            wall_projection_matrix=np.eye(3, dtype=np.float32),
+            field_width=100,
+            field_height=100,
+            wall_side="top",
+            wall_height=100,
+        )
+
+        self.assertEqual(len(frame), 1)
+        depth, relative_height = frame[0]
+        self.assertGreater(depth, 0)
+        self.assertEqual(relative_height, 0)
+
+    def test_air_profile_reports_elevated_ball_from_ball_bottom(self):
+        mask = np.zeros((100, 100), dtype=np.uint8)
+        cv2.circle(mask, (30, 40), 8, 255, -1)
+
+        frame = processor_cli.build_air_profile_frame(
+            [(30, 40)],
+            bbox=(0, 0, 100, 100),
+            mask_binary=mask,
+            field_projection_matrix=np.eye(3, dtype=np.float32),
+            wall_projection_matrix=np.eye(3, dtype=np.float32),
+            field_width=100,
+            field_height=100,
+            wall_side="top",
+            wall_height=100,
+        )
+
+        self.assertEqual(len(frame), 1)
+        _depth, relative_height = frame[0]
+        self.assertGreater(relative_height, 0)
+
+    def test_air_profile_requires_support_from_matching_side_wall(self):
+        mask = np.zeros((100, 100), dtype=np.uint8)
+        cv2.circle(mask, (10, 40), 8, 255, -1)
+
+        _field_points, wrong_side_air_points = processor_cli.project_synchronized_field_and_air_points(
+            [(10, 40)],
+            bbox=(0, 0, 100, 100),
+            field_projection_matrix=np.eye(3, dtype=np.float32),
+            field_width=100,
+            field_height=100,
+            mask_binary=mask,
+            wall_references=[{"side": "right", "projection_matrix": np.eye(3, dtype=np.float32)}],
+        )
+        _field_points, matching_side_air_points = processor_cli.project_synchronized_field_and_air_points(
+            [(10, 40)],
+            bbox=(0, 0, 100, 100),
+            field_projection_matrix=np.eye(3, dtype=np.float32),
+            field_width=100,
+            field_height=100,
+            mask_binary=mask,
+            wall_references=[{"side": "left", "projection_matrix": np.eye(3, dtype=np.float32)}],
+        )
+
+        self.assertEqual(len(wrong_side_air_points), 1)
+        self.assertEqual(wrong_side_air_points[0][1], 0)
+        self.assertEqual(len(matching_side_air_points), 1)
+        self.assertGreater(matching_side_air_points[0][1], 0)
+
+    def test_build_wall_references_supports_multiple_side_walls(self):
+        field_quad = np.array(
+            [
+                [0.0, 0.0],
+                [100.0, 0.0],
+                [100.0, 100.0],
+                [0.0, 100.0],
+            ],
+            dtype=np.float32,
+        )
+        wall_references = processor_cli.build_wall_references(
+            field_quad,
+            wall_quads={
+                "left": np.array([[0.0, 10.0], [10.0, 0.0], [12.0, 90.0], [0.0, 100.0]], dtype=np.float32),
+                "right": np.array([[90.0, 0.0], [100.0, 10.0], [100.0, 100.0], [88.0, 90.0]], dtype=np.float32),
+            },
+        )
+
+        self.assertEqual([reference["side"] for reference in wall_references], ["left", "right"])
+
+    def test_filter_air_profile_points_suppresses_singleton_noise(self):
+        filtered = processor_cli.filter_air_profile_points(
+            [[1000, 420], [2000, 0], [3000, 120]],
+        )
+        self.assertEqual(filtered, [[1000, 0], [2000, 0], [3000, 0]])
+
+    def test_filter_air_profile_points_keeps_bursts_and_scales_height(self):
+        filtered = processor_cli.filter_air_profile_points(
+            [[1000, 1800], [2000, 520], [3000, 120]],
+        )
+        self.assertEqual(filtered[0][1], 5400)
+        self.assertEqual(filtered[1][1], 1560)
+        self.assertEqual(filtered[2][1], 0)
+
+    def test_write_dynamic_assets_writes_air_profile_for_current_wall_quad(self):
+        if shutil.which('ffmpeg') is None and not processor_cli.ffmpeg_binary():
+            self.skipTest('ffmpeg is not available')
+
+        source_frames = []
+        for idx in range(3):
+            frame = np.zeros((100, 100, 3), dtype=np.uint8)
+            cv2.circle(frame, (70, 80 - idx), 8, (0, 255, 255), -1)
+            source_frames.append(frame)
+
+        temp_dir = Path(tempfile.mkdtemp(prefix='fdm-air-profile-out-'))
+        video_path = self._write_test_video(temp_dir / "air_profile_fixture", source_frames, fps=3.0)
+        try:
+            session_dir = temp_dir / 'session'
+            field_quad = np.array(
+                [
+                    [0.0, 0.0],
+                    [99.0, 0.0],
+                    [99.0, 99.0],
+                    [0.0, 99.0],
+                ],
+                dtype=np.float32,
+            )
+            wall_quad = np.array(
+                [
+                    [84.0, 26.0],
+                    [99.0, 44.0],
+                    [99.0, 60.0],
+                    [84.0, 40.0],
+                ],
+                dtype=np.float32,
+            )
+            processor_cli.write_dynamic_assets(
+                str(video_path),
+                str(session_dir),
+                str(session_dir / 'field-map.json'),
+                str(session_dir / 'raw-data.txt'),
+                bbox=(0, 0, 100, 100),
+                field_quad=field_quad,
+                average_display_color=(255, 0, 255),
+                fuel_base_color_rgb=processor_cli.DEFAULT_FUEL_BASE_COLOR_RGB,
+                field_image_path=processor_cli.DEFAULT_FIELD_IMAGE_PATH,
+                wall_quad=wall_quad,
+                target_process_fps=3.0,
+                overlay_output='frames',
+                backend_name='cpu',
+                working_scale=1.0,
+                detector_budget=32,
+                max_active_tracks=64,
+            )
+
+            air_profile_path = session_dir / 'air-profile.json'
+            self.assertTrue(air_profile_path.exists())
+            payload = json.loads(air_profile_path.read_text('utf8'))
+            self.assertEqual(payload["wallSide"], "right")
+            self.assertEqual(len(payload["frames"]), 3)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_peak_detector_respects_budget(self):
         mask = np.zeros((120, 120), dtype=np.uint8)
@@ -366,6 +611,54 @@ class AnalysisTests(unittest.TestCase):
         self.assertLessEqual(len(first), 10)
         self.assertLessEqual(len(second), 10)
 
+    def test_temporal_stabilizer_works_when_module_int_is_shadowed(self):
+        stabilizer = processor_cli.FuelTemporalStabilizer(
+            max_misses=2,
+            history_size=4,
+            min_baseline_count=999,
+        )
+        original_int = processor_cli.int if hasattr(processor_cli, "int") else None
+        had_original = hasattr(processor_cli, "int")
+        try:
+            # Reproduce the production failure mode where module-level `int` is shadowed.
+            processor_cli.int = iter(())
+            first, bad_first = stabilizer.stabilize([(10, 10), (30, 30)])
+            second, bad_second = stabilizer.stabilize([(12, 10), (32, 30)])
+        finally:
+            if had_original:
+                processor_cli.int = original_int
+            else:
+                delattr(processor_cli, "int")
+
+        self.assertFalse(bad_first)
+        self.assertFalse(bad_second)
+        self.assertGreaterEqual(len(first), 2)
+        self.assertGreaterEqual(len(second), 2)
+
+    def test_temporal_stabilizer_works_when_module_float_is_shadowed(self):
+        stabilizer = processor_cli.FuelTemporalStabilizer(
+            max_misses=2,
+            history_size=4,
+            min_baseline_count=999,
+        )
+        original_float = processor_cli.float if hasattr(processor_cli, "float") else None
+        had_original = hasattr(processor_cli, "float")
+        try:
+            # Reproduce production-like failures where module-level `float` is shadowed.
+            processor_cli.float = tuple
+            first, bad_first = stabilizer.stabilize([(10, 10), (30, 30)])
+            second, bad_second = stabilizer.stabilize([(12, 10), (32, 30)])
+        finally:
+            if had_original:
+                processor_cli.float = original_float
+            else:
+                delattr(processor_cli, "float")
+
+        self.assertFalse(bad_first)
+        self.assertFalse(bad_second)
+        self.assertGreaterEqual(len(first), 2)
+        self.assertGreaterEqual(len(second), 2)
+
     def test_write_dynamic_assets_video_output_creates_overlay_video(self):
         if shutil.which('ffmpeg') is None and not processor_cli.ffmpeg_binary():
             self.skipTest('ffmpeg is not available')
@@ -388,6 +681,7 @@ class AnalysisTests(unittest.TestCase):
                 bbox=(0, 0, 100, 80),
                 field_quad=None,
                 average_display_color=(255, 0, 255),
+                fuel_base_color_rgb=processor_cli.DEFAULT_FUEL_BASE_COLOR_RGB,
                 field_image_path=processor_cli.DEFAULT_FIELD_IMAGE_PATH,
                 target_process_fps=4.0,
                 overlay_output='video',

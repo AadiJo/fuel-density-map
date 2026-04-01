@@ -6,6 +6,16 @@ import cv2
 import numpy as np
 
 
+DEFAULT_FUEL_BASE_COLOR_RGB = (255, 255, 0)
+DEFAULT_HUE_TOLERANCE = 15
+DEFAULT_MIN_SATURATION = 70
+DEFAULT_MIN_VALUE = 110
+MIN_PICKER_SATURATION_FLOOR = 12
+MIN_PICKER_VALUE_FLOOR = 48
+PICKER_SATURATION_MARGIN = 28
+PICKER_VALUE_MARGIN = 36
+
+
 def yellow_pixel_mask(frame):
     return (
         (frame[:, :, 2] > 200) &
@@ -14,10 +24,78 @@ def yellow_pixel_mask(frame):
     )
 
 
+def _normalize_rgb_color(base_color_rgb):
+    if base_color_rgb is None:
+        return DEFAULT_FUEL_BASE_COLOR_RGB
+    if len(base_color_rgb) != 3:
+        return DEFAULT_FUEL_BASE_COLOR_RGB
+    r, g, b = base_color_rgb
+    return (
+        int(np.clip(int(r), 0, 255)),
+        int(np.clip(int(g), 0, 255)),
+        int(np.clip(int(b), 0, 255)),
+    )
+
+
+def fuel_pixel_mask_hsv(
+    frame_bgr,
+    base_color_rgb=None,
+    hue_tolerance=DEFAULT_HUE_TOLERANCE,
+    min_saturation=DEFAULT_MIN_SATURATION,
+    min_value=DEFAULT_MIN_VALUE,
+):
+    """HSV mask around a configurable RGB base color, with wrap-safe hue bounds."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    red, green, blue = _normalize_rgb_color(base_color_rgb)
+    sample_bgr = np.uint8([[[blue, green, red]]])
+    sample_hsv = cv2.cvtColor(sample_bgr, cv2.COLOR_BGR2HSV)[0, 0]
+    base_hue = int(sample_hsv[0])
+    base_saturation = int(sample_hsv[1])
+    base_value = int(sample_hsv[2])
+
+    hue_tolerance = int(max(0, min(int(hue_tolerance), 90)))
+    sat_floor = int(np.clip(int(min_saturation), 0, 255))
+    value_floor = int(np.clip(int(min_value), 0, 255))
+
+    # When the picked sample itself is pale, keep the floor close to the pick so
+    # washed-out feeds still match after using the color picker.
+    sat_floor = min(
+        sat_floor,
+        max(MIN_PICKER_SATURATION_FLOOR, base_saturation - PICKER_SATURATION_MARGIN),
+    )
+    value_floor = min(
+        value_floor,
+        max(MIN_PICKER_VALUE_FLOOR, base_value - PICKER_VALUE_MARGIN),
+    )
+
+    lower_h = base_hue - hue_tolerance
+    upper_h = base_hue + hue_tolerance
+    if lower_h < 0:
+        low_a = np.array([0, sat_floor, value_floor], dtype=np.uint8)
+        high_a = np.array([upper_h, 255, 255], dtype=np.uint8)
+        low_b = np.array([180 + lower_h, sat_floor, value_floor], dtype=np.uint8)
+        high_b = np.array([179, 255, 255], dtype=np.uint8)
+        return cv2.bitwise_or(cv2.inRange(hsv, low_a, high_a), cv2.inRange(hsv, low_b, high_b))
+
+    if upper_h > 179:
+        low_a = np.array([lower_h, sat_floor, value_floor], dtype=np.uint8)
+        high_a = np.array([179, 255, 255], dtype=np.uint8)
+        low_b = np.array([0, sat_floor, value_floor], dtype=np.uint8)
+        high_b = np.array([upper_h - 180, 255, 255], dtype=np.uint8)
+        return cv2.bitwise_or(cv2.inRange(hsv, low_a, high_a), cv2.inRange(hsv, low_b, high_b))
+
+    low = np.array([lower_h, sat_floor, value_floor], dtype=np.uint8)
+    high = np.array([upper_h, 255, 255], dtype=np.uint8)
+    return cv2.inRange(hsv, low, high)
+
+
+def fuel_pixel_mask(frame_bgr, base_color_rgb=None):
+    return fuel_pixel_mask_hsv(frame_bgr, base_color_rgb) > 0
+
+
 def yellow_pixel_mask_hsv(frame_bgr):
     """HSV-based yellow detection, tolerant of shadows and compression."""
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    return cv2.inRange(hsv, np.array([15, 70, 110]), np.array([45, 255, 255]))
+    return fuel_pixel_mask_hsv(frame_bgr, DEFAULT_FUEL_BASE_COLOR_RGB)
 
 
 def _frame_mask_for_region(frame, bbox=None):

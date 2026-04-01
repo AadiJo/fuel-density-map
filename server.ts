@@ -2,6 +2,7 @@ import { execSync, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { clamp01, normalizedPointToPixel, sampleRgbFromRawRgb24Frame } from './color_sampling'
 
 type SessionStatus = 'idle' | 'downloading' | 'ready' | 'processing' | 'completed' | 'error'
 
@@ -18,6 +19,14 @@ type Point = {
 }
 
 type FieldQuad = [Point, Point, Point, Point]
+type WallSide = 'left' | 'right'
+type WallQuads = Partial<Record<WallSide, FieldQuad>>
+
+type RGBColor = {
+  r: number
+  g: number
+  b: number
+}
 
 type OverlayStats = {
   backend?: 'cpu' | 'cuda'
@@ -57,6 +66,9 @@ type OverlayStats = {
 /** Matches processor_cli.py PROGRESS_PREFIX / emit_progress JSON lines. */
 const PROGRESS_JSON_PREFIX = 'PROGRESS_JSON:'
 
+/** Default yt-dlp YouTube flow can use InnerTube clients that return UNPLAYABLE for some public uploads; android works. */
+const YT_DLP_ARGS = ['--extractor-args', 'youtube:player_client=android'] as const
+
 type ProcessingProgress = {
   phase: string
   current: number
@@ -73,8 +85,11 @@ type SessionRecord = {
   createdAt: string
   updatedAt: string
   status: SessionStatus
+  fuelBaseColor: RGBColor
   bbox: BBox | null
   fieldQuad: FieldQuad | null
+  wallQuad: FieldQuad | null
+  wallQuads: WallQuads
   video: {
     fileName: string | null
     width: number | null
@@ -89,6 +104,7 @@ type SessionRecord = {
     framesDirName: string | null
     rawDataFileName: string
     fieldMapDataFileName: string | null
+    airProfileDataFileName?: string | null
     stats: OverlayStats
   } | null
   lastError: string | null
@@ -151,13 +167,14 @@ function resolveWindowsExecutable(exeName: string): string | null {
 
 const SPAWN_ENV = IS_WIN ? envWithWindowsPathExtras() : process.env
 
+const LOCAL_VENV_PYTHON = IS_WIN
+  ? path.join(ROOT_DIR, '.venv', 'Scripts', 'python.exe')
+  : path.join(ROOT_DIR, '.venv', 'bin', 'python')
 const LOCAL_CUDA_VENV_PYTHON = IS_WIN
   ? path.join(ROOT_DIR, '.venv-opencv-cuda', 'Scripts', 'python.exe')
   : path.join(ROOT_DIR, '.venv-opencv-cuda', 'bin', 'python')
 const PYTHON_BIN = Bun.env.PYTHON_BIN ?? 'python'
-const PROCESSOR_PYTHON_BIN =
-  Bun.env.PROCESSOR_PYTHON_BIN ??
-  (existsSync(LOCAL_CUDA_VENV_PYTHON) ? LOCAL_CUDA_VENV_PYTHON : PYTHON_BIN)
+const PROCESSOR_PYTHON_BIN = Bun.env.PROCESSOR_PYTHON_BIN ?? null
 const FFMPEG_BIN =
   Bun.env.FFMPEG_BIN ??
   (IS_WIN ? resolveWindowsExecutable('ffmpeg.exe') : null) ??
@@ -169,6 +186,7 @@ const FFPROBE_BIN =
 const PORT = Number(Bun.env.PORT ?? '3001')
 const SESSIONS_DIR = path.join(ROOT_DIR, 'sessions')
 const CLIENT_DIST_DIR = path.join(ROOT_DIR, 'webui', 'dist')
+const DEFAULT_FUEL_BASE_COLOR: RGBColor = { r: 255, g: 255, b: 0 }
 
 await mkdir(SESSIONS_DIR, { recursive: true })
 
@@ -271,32 +289,38 @@ function orderQuadPoints(points: Point[]): FieldQuad | null {
     return null
   }
 
-  const sums = points.map((point) => point.x + point.y)
-  const diffs = points.map((point) => point.y - point.x)
-  const tlIdx = sums.indexOf(Math.min(...sums))
-  const brIdx = sums.indexOf(Math.max(...sums))
-  const trIdx = diffs.indexOf(Math.min(...diffs))
-  const blIdx = diffs.indexOf(Math.max(...diffs))
+  const center = points.reduce(
+    (acc, point) => ({ x: acc.x + point.x / points.length, y: acc.y + point.y / points.length }),
+    { x: 0, y: 0 },
+  )
 
-  if (new Set([tlIdx, trIdx, brIdx, blIdx]).size === 4) {
-    return [points[tlIdx], points[trIdx], points[brIdx], points[blIdx]]
-  }
-
-  const sortedByY = [...points].sort((left, right) => {
-    if (left.y !== right.y) {
-      return left.y - right.y
-    }
-    return left.x - right.x
+  const sortedByAngle = [...points].sort((left, right) => {
+    const leftAngle = Math.atan2(left.y - center.y, left.x - center.x)
+    const rightAngle = Math.atan2(right.y - center.y, right.x - center.x)
+    return leftAngle - rightAngle
   })
 
-  const topRow = sortedByY.slice(0, 2).sort((left, right) => left.x - right.x)
-  const bottomRow = sortedByY.slice(2).sort((left, right) => left.x - right.x)
-  if (topRow.length !== 2 || bottomRow.length !== 2) {
+  let topEdgeStartIndex = 0
+  let bestTopEdgeScore = Number.POSITIVE_INFINITY
+  for (let index = 0; index < sortedByAngle.length; index += 1) {
+    const a = sortedByAngle[index]
+    const b = sortedByAngle[(index + 1) % sortedByAngle.length]
+    const edgeScore = (a.y + b.y) * 0.5
+    if (edgeScore < bestTopEdgeScore) {
+      bestTopEdgeScore = edgeScore
+      topEdgeStartIndex = index
+    }
+  }
+
+  const rotated = sortedByAngle.map((_, index) => sortedByAngle[(topEdgeStartIndex + index) % sortedByAngle.length])
+  if (rotated.length !== 4) {
     return null
   }
 
-  const [topLeft, topRight] = topRow
-  const [bottomLeft, bottomRight] = bottomRow
+  const [edgeTopA, edgeTopB, edgeBottomA, edgeBottomB] = rotated
+  const [topLeft, topRight] = edgeTopA.x <= edgeTopB.x ? [edgeTopA, edgeTopB] : [edgeTopB, edgeTopA]
+  const [bottomLeft, bottomRight] =
+    edgeBottomA.x <= edgeBottomB.x ? [edgeBottomA, edgeBottomB] : [edgeBottomB, edgeBottomA]
   return [topLeft, topRight, bottomRight, bottomLeft]
 }
 
@@ -313,9 +337,54 @@ function normalizeFieldQuad(input: unknown) {
   return orderQuadPoints(points as Point[])
 }
 
+function normalizeWallQuads(input: unknown): WallQuads {
+  if (!input || typeof input !== 'object') {
+    return {}
+  }
+  const raw = input as Record<string, unknown>
+  const next: WallQuads = {}
+  for (const side of ['left', 'right'] as const) {
+    const quad = normalizeFieldQuad(raw[side])
+    if (quad) {
+      next[side] = quad
+    }
+  }
+  return next
+}
+
+function syncLegacyWallQuad(record: SessionRecord) {
+  record.wallQuads = record.wallQuads ?? {}
+  record.wallQuad = record.wallQuads.right ?? record.wallQuad ?? null
+}
+
+function normalizeRgbColor(input: unknown) {
+  if (!input || typeof input !== 'object') {
+    return null
+  }
+  const raw = input as Record<string, unknown>
+  const r = Number(raw.r)
+  const g = Number(raw.g)
+  const b = Number(raw.b)
+  if (![r, g, b].every(Number.isFinite)) {
+    return null
+  }
+  return {
+    r: Math.max(0, Math.min(255, Math.round(r))),
+    g: Math.max(0, Math.min(255, Math.round(g))),
+    b: Math.max(0, Math.min(255, Math.round(b))),
+  }
+}
+
 function bboxFromQuad(quad: FieldQuad, padding = 0.01) {
-  const xs = quad.map((point) => point.x)
-  const ys = quad.map((point) => point.y)
+  return bboxFromPoints(quad, padding)
+}
+
+function bboxFromPoints(points: Point[], padding = 0.01) {
+  if (!points.length) {
+    return null
+  }
+  const xs = points.map((point) => point.x)
+  const ys = points.map((point) => point.y)
   const minX = clamp(Math.min(...xs) - padding)
   const minY = clamp(Math.min(...ys) - padding)
   const maxX = clamp(Math.max(...xs) + padding)
@@ -339,14 +408,26 @@ function denormalizeFieldQuad(quad: FieldQuad, width: number, height: number) {
 async function readSessionRecord(sessionId: string) {
   const content = await readFile(sessionFile(sessionId), 'utf8')
   const parsed = JSON.parse(content) as SessionRecord
-  return {
+  const normalizedFuelBaseColor = normalizeRgbColor((parsed as SessionRecord).fuelBaseColor) ?? DEFAULT_FUEL_BASE_COLOR
+  const legacyWallQuad = normalizeFieldQuad((parsed as SessionRecord).wallQuad) ?? null
+  const normalizedWallQuads = normalizeWallQuads((parsed as SessionRecord).wallQuads)
+  if (!normalizedWallQuads.right && legacyWallQuad) {
+    normalizedWallQuads.right = legacyWallQuad
+  }
+  const record = {
     ...parsed,
-    fieldQuad: parsed.fieldQuad ?? null,
+    fuelBaseColor: normalizedFuelBaseColor,
+    fieldQuad: normalizeFieldQuad(parsed.fieldQuad) ?? null,
+    wallQuad: normalizedWallQuads.right ?? legacyWallQuad,
+    wallQuads: normalizedWallQuads,
     processingProgress: parsed.processingProgress ?? null,
   }
+  syncLegacyWallQuad(record)
+  return record
 }
 
 async function writeSessionRecord(record: SessionRecord) {
+  syncLegacyWallQuad(record)
   await mkdir(sessionDir(record.id), { recursive: true })
   await writeFile(sessionFile(record.id), `${JSON.stringify(record, null, 2)}\n`, 'utf8')
 }
@@ -371,6 +452,12 @@ function toClientSession(record: SessionRecord) {
       : existsSync(path.join(sessionDir(record.id), 'field-map.json'))
         ? 'field-map.json'
         : null
+  const airProfileDataFileName =
+    record.overlay?.airProfileDataFileName && existsSync(path.join(sessionDir(record.id), record.overlay.airProfileDataFileName))
+      ? record.overlay.airProfileDataFileName
+      : existsSync(path.join(sessionDir(record.id), 'air-profile.json'))
+        ? 'air-profile.json'
+        : null
 
   return {
     ...record,
@@ -389,11 +476,15 @@ function toClientSession(record: SessionRecord) {
           : null,
       overlayFrameUrlTemplate:
         overlayFramesDirName
-          ? `/media-frame/${record.id}/__FRAME__.webp`
+          ? `/media-frame/${record.id}/__FRAME__.png`
           : null,
       fieldMapDataUrl:
         fieldMapDataFileName
           ? `/media/${record.id}/${encodeURIComponent(fieldMapDataFileName)}`
+          : null,
+      airProfileDataUrl:
+        airProfileDataFileName
+          ? `/media/${record.id}/${encodeURIComponent(airProfileDataFileName)}`
           : null,
     },
   }
@@ -461,13 +552,99 @@ async function runCommand(command: string, args: string[], cwd = ROOT_DIR) {
   })
 }
 
+async function runCommandBuffer(command: string, args: string[], cwd = ROOT_DIR) {
+  return await new Promise<{ stdout: Buffer; stderr: string }>((resolve, reject) => {
+    const child = spawn(command, args, { cwd, windowsHide: true, env: SPAWN_ENV })
+    const stdoutChunks: Buffer[] = []
+    let stderr = ''
+
+    child.stdout.on('data', (chunk) => {
+      stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    })
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+
+    child.on('error', (err) => {
+      const e = err as NodeJS.ErrnoException
+      if (e.code === 'ENOENT') {
+        reject(new Error(spawnNotFoundMessage(command, e)))
+        return
+      }
+      reject(err)
+    })
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ stdout: Buffer.concat(stdoutChunks), stderr })
+        return
+      }
+      reject(new Error(stderr.trim() || `${command} exited with code ${code}`))
+    })
+  })
+}
+
+async function sampleSessionVideoColor(
+  record: SessionRecord,
+  normalizedX: number,
+  normalizedY: number,
+  timeSec: number,
+): Promise<RGBColor> {
+  if (!record.video.fileName) {
+    throw new Error('No video file for this session.')
+  }
+  if (!record.video.width || !record.video.height) {
+    throw new Error('Video dimensions are missing for this session.')
+  }
+
+  const width = Math.max(1, Math.floor(record.video.width))
+  const height = Math.max(1, Math.floor(record.video.height))
+  const { px, py } = normalizedPointToPixel(normalizedX, normalizedY, width, height)
+
+  const maxDuration = Number.isFinite(record.video.duration ?? NaN)
+    ? Math.max(0, (record.video.duration as number) - 0.001)
+    : Number.POSITIVE_INFINITY
+  const seek = Math.min(Math.max(0, Number.isFinite(timeSec) ? timeSec : 0), maxDuration)
+
+  const videoPath = path.join(sessionDir(record.id), record.video.fileName)
+  if (!existsSync(videoPath)) {
+    throw new Error('Video file is missing on disk.')
+  }
+
+  const { stdout } = await runCommandBuffer(FFMPEG_BIN, [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-ss',
+    seek.toFixed(3),
+    '-i',
+    videoPath,
+    '-frames:v',
+    '1',
+    '-f',
+    'rawvideo',
+    '-pix_fmt',
+    'rgb24',
+    '-',
+  ])
+
+  const color = sampleRgbFromRawRgb24Frame(stdout, width, height, px, py, 2)
+  return {
+    r: color.r,
+    g: color.g,
+    b: color.b,
+  }
+}
+
 async function runProcessorWithProgress(
+  pythonBin: string,
   record: SessionRecord,
   args: string[],
   runStartedAt: string,
 ): Promise<{ stdout: string; stderr: string }> {
   return await new Promise((resolve, reject) => {
-    const child = spawn(PROCESSOR_PYTHON_BIN, ['-u', ...args], {
+    const child = spawn(pythonBin, ['-u', ...args], {
       cwd: ROOT_DIR,
       windowsHide: true,
       env: { ...SPAWN_ENV, PYTHONUNBUFFERED: '1' },
@@ -515,42 +692,73 @@ async function runProcessorWithProgress(
       stdout += chunk.toString()
     })
 
+    const appendStderrLine = (line: string) => {
+      if (!line) {
+        return
+      }
+      stderr += `${line}\n`
+    }
+
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString()
-      stderr += text
       stderrLineBuf += text
       const lines = stderrLineBuf.split('\n')
       stderrLineBuf = lines.pop() ?? ''
       for (const line of lines) {
         if (line.startsWith(PROGRESS_JSON_PREFIX)) {
           applyProgressLine(line.slice(PROGRESS_JSON_PREFIX.length))
+          continue
         }
+        appendStderrLine(line)
       }
     })
 
     child.on('error', reject)
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (writeTimer) {
         clearTimeout(writeTimer)
         writeTimer = null
       }
       if (stderrLineBuf.startsWith(PROGRESS_JSON_PREFIX)) {
         applyProgressLine(stderrLineBuf.slice(PROGRESS_JSON_PREFIX.length))
+      } else {
+        appendStderrLine(stderrLineBuf)
       }
       flushRecord()
       if (code === 0) {
-        resolve({ stdout, stderr })
+        resolve({ stdout, stderr: stderr.trimEnd() })
         return
       }
-      reject(new Error(stderr.trim() || stdout.trim() || `${PROCESSOR_PYTHON_BIN} exited with code ${code}`))
+      const exitDetail =
+        signal != null
+          ? `${pythonBin} exited from signal ${signal}`
+          : `${pythonBin} exited with code ${code}`
+      reject(new Error(stderr.trim() || exitDetail || stdout.trim()))
     })
   })
+}
+
+function resolveProcessorPythonBin(backend: string) {
+  if (PROCESSOR_PYTHON_BIN) {
+    return PROCESSOR_PYTHON_BIN
+  }
+  if (backend === 'cuda' && existsSync(LOCAL_CUDA_VENV_PYTHON)) {
+    return LOCAL_CUDA_VENV_PYTHON
+  }
+  if (existsSync(LOCAL_VENV_PYTHON)) {
+    return LOCAL_VENV_PYTHON
+  }
+  if (existsSync(LOCAL_CUDA_VENV_PYTHON)) {
+    return LOCAL_CUDA_VENV_PYTHON
+  }
+  return PYTHON_BIN
 }
 
 async function getYouTubeMetadata(url: string) {
   const { stdout } = await runCommand(PYTHON_BIN, [
     '-m',
     'yt_dlp',
+    ...YT_DLP_ARGS,
     '--dump-single-json',
     '--skip-download',
     '--no-playlist',
@@ -578,6 +786,7 @@ async function downloadVideo(url: string, record: SessionRecord) {
   await runCommand(PYTHON_BIN, [
     '-m',
     'yt_dlp',
+    ...YT_DLP_ARGS,
     '--no-playlist',
     '-f',
     'best[ext=mp4][acodec!=none][vcodec!=none]/best[ext=mp4]/best',
@@ -696,7 +905,10 @@ async function importSession(url: string): Promise<{ record: SessionRecord; vide
     record = await readSessionRecord(id)
     record.youtubeUrl = url
     record.title = metadata.title
+    record.fuelBaseColor = normalizeRgbColor(record.fuelBaseColor) ?? DEFAULT_FUEL_BASE_COLOR
     record.fieldQuad = record.fieldQuad ?? null
+    record.wallQuad = record.wallQuad ?? null
+    record.wallQuads = record.wallQuads ?? {}
     record.video.width = metadata.width
     record.video.height = metadata.height
     record.video.duration = metadata.duration
@@ -713,8 +925,11 @@ async function importSession(url: string): Promise<{ record: SessionRecord; vide
       createdAt: now,
       updatedAt: now,
       status: 'downloading',
+      fuelBaseColor: DEFAULT_FUEL_BASE_COLOR,
       bbox: null,
       fieldQuad: null,
+      wallQuad: null,
+      wallQuads: {},
       video: {
         fileName: null,
         width: metadata.width,
@@ -764,6 +979,10 @@ async function updateSession(sessionId: string, mutator: (record: SessionRecord)
 async function processSession(sessionId: string) {
   const record = await readSessionRecord(sessionId)
 
+  if (record.status === 'processing') {
+    throw new Error('This session is already processing. Wait for the current run to finish.')
+  }
+
   if (!record.video.fileName) {
     throw new Error('The session does not have a downloaded video yet.')
   }
@@ -781,6 +1000,16 @@ async function processSession(sessionId: string) {
   const pixelQuad = record.fieldQuad
     ? denormalizeFieldQuad(record.fieldQuad, record.video.width, record.video.height)
     : null
+  const pixelWallQuads = (['left', 'right'] as const).reduce<Partial<Record<WallSide, ReturnType<typeof denormalizeFieldQuad>>>>(
+    (acc, side) => {
+      const quad = record.wallQuads?.[side]
+      if (quad) {
+        acc[side] = denormalizeFieldQuad(quad, record.video.width!, record.video.height!)
+      }
+      return acc
+    },
+    {},
+  )
   const videoPath = path.join(sessionDir(sessionId), record.video.fileName)
 
   const runStartedAt = new Date().toISOString()
@@ -798,15 +1027,23 @@ async function processSession(sessionId: string) {
 
   const logPath = path.join(sessionDir(sessionId), 'process.log')
   try {
-    const backendArg = Bun.env.PROCESSOR_BACKEND
+    const backendArg = Bun.env.PROCESSOR_BACKEND ?? 'cpu'
+    const processorPythonBin = resolveProcessorPythonBin(backendArg)
     const overlayOutputArg = Bun.env.PROCESSOR_OVERLAY_OUTPUT ?? 'frames'
     const workingScaleArg = Bun.env.PROCESSOR_WORKING_SCALE
     const detectorBudgetArg = Bun.env.PROCESSOR_DETECTOR_BUDGET
     const maxActiveTracksArg = Bun.env.PROCESSOR_MAX_ACTIVE_TRACKS
-    const detectorModeArg = Bun.env.PROCESSOR_DETECTOR_MODE ?? 'hybrid'
+    const detectorModeArg = Bun.env.PROCESSOR_DETECTOR_MODE ?? 'legacy'
     await rm(path.join(sessionDir(sessionId), 'overlay-video.mp4'), { force: true })
     await rm(path.join(sessionDir(sessionId), 'overlay-frames'), { recursive: true, force: true })
+    await rm(path.join(sessionDir(sessionId), 'overlay.png'), { force: true })
+    await rm(path.join(sessionDir(sessionId), 'overlay-transparent.png'), { force: true })
+    await rm(path.join(sessionDir(sessionId), 'raw_data.txt'), { force: true })
+    await rm(path.join(sessionDir(sessionId), 'field-map.json'), { force: true })
+    await rm(path.join(sessionDir(sessionId), 'air-profile.json'), { force: true })
+    await rm(path.join(sessionDir(sessionId), 'stats.json'), { force: true })
     const { stdout, stderr } = await runProcessorWithProgress(
+      processorPythonBin,
       record,
       [
         'processor_cli.py',
@@ -822,12 +1059,26 @@ async function processSession(sessionId: string) {
               pixelQuad.map((point) => `${point.x},${point.y}`).join(','),
             ]
           : []),
+        ...(pixelWallQuads.left
+          ? [
+              '--wall-quad-left',
+              pixelWallQuads.left.map((point) => `${point.x},${point.y}`).join(','),
+            ]
+          : []),
+        ...(pixelWallQuads.right
+          ? [
+              '--wall-quad-right',
+              pixelWallQuads.right.map((point) => `${point.x},${point.y}`).join(','),
+            ]
+          : []),
         ...(backendArg ? ['--backend', backendArg] : []),
         ...(overlayOutputArg ? ['--overlay-output', overlayOutputArg] : []),
         ...(workingScaleArg ? ['--working-scale', workingScaleArg] : []),
         ...(detectorBudgetArg ? ['--detector-budget', detectorBudgetArg] : []),
         ...(maxActiveTracksArg ? ['--max-active-tracks', maxActiveTracksArg] : []),
         ...(detectorModeArg ? ['--detector-mode', detectorModeArg] : []),
+        '--fuel-base-color',
+        `${record.fuelBaseColor.r},${record.fuelBaseColor.g},${record.fuelBaseColor.b}`,
       ],
       runStartedAt,
     )
@@ -857,6 +1108,9 @@ async function processSession(sessionId: string) {
       framesDirName: overlayFramesDirName,
       rawDataFileName: 'raw_data.txt',
       fieldMapDataFileName: 'field-map.json',
+      airProfileDataFileName: existsSync(path.join(sessionDir(sessionId), 'air-profile.json'))
+        ? 'air-profile.json'
+        : null,
       stats,
     }
     record.bbox = normalizedBBox
@@ -1010,6 +1264,7 @@ async function serveClientAsset(urlPath: string) {
 
 Bun.serve({
   port: PORT,
+  idleTimeout: 255,
   async fetch(request) {
     const url = new URL(request.url)
 
@@ -1116,6 +1371,72 @@ Bun.serve({
         return json(toClientSession(record))
       }
 
+      const wallQuadsMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/wall-quads\/(left|right)$/)
+      if (request.method === 'POST' && wallQuadsMatch) {
+        const body = await parseBody<{ wallQuad?: FieldQuad | null }>(request)
+        if (!body || typeof body !== 'object' || !('wallQuad' in body)) {
+          return json({ error: 'Request body must include wallQuad (or null to clear).' }, { status: 400 })
+        }
+        const wallSide = wallQuadsMatch[2] as WallSide
+
+        let normalizedWallQuad: FieldQuad | null
+        if (body.wallQuad === null) {
+          normalizedWallQuad = null
+        } else {
+          const normalized = normalizeFieldQuad(body.wallQuad)
+          if (!normalized) {
+            return json(
+              {
+                error:
+                  'Could not save that wall outline. Use four corners on the driver station wall.',
+              },
+              { status: 400 },
+            )
+          }
+          normalizedWallQuad = normalized
+        }
+
+        const record = await updateSession(wallQuadsMatch[1], (session) => {
+          session.wallQuads = session.wallQuads ?? {}
+          if (normalizedWallQuad) {
+            session.wallQuads[wallSide] = normalizedWallQuad
+          } else {
+            delete session.wallQuads[wallSide]
+          }
+          session.wallQuad = session.wallQuads.right ?? null
+          session.overlay = null
+          session.status = session.fieldQuad || session.bbox ? 'ready' : 'idle'
+        })
+
+        return json(toClientSession(record))
+      }
+
+      const legacyWallQuadMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/wall-quad$/)
+      if (request.method === 'POST' && legacyWallQuadMatch) {
+        const body = await parseBody<{ wallQuad?: FieldQuad | null }>(request)
+        if (!body || typeof body !== 'object' || !('wallQuad' in body)) {
+          return json({ error: 'Request body must include wallQuad (or null to clear).' }, { status: 400 })
+        }
+        const record = await updateSession(legacyWallQuadMatch[1], (session) => {
+          session.wallQuads = session.wallQuads ?? {}
+          if (body.wallQuad === null) {
+            delete session.wallQuads.right
+            session.wallQuad = null
+          } else {
+            const normalized = normalizeFieldQuad(body.wallQuad)
+            if (!normalized) {
+              throw new Error('Could not save that wall outline. Use four corners on the driver station wall.')
+            }
+            session.wallQuads.right = normalized
+            session.wallQuad = normalized
+          }
+          session.overlay = null
+          session.status = session.fieldQuad || session.bbox ? 'ready' : 'idle'
+        })
+
+        return json(toClientSession(record))
+      }
+
       const metadataMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/video-metadata$/)
       if (request.method === 'POST' && metadataMatch) {
         const body = await parseBody<{ width?: number; height?: number; duration?: number }>(request)
@@ -1123,6 +1444,51 @@ Bun.serve({
           session.video.width = typeof body?.width === 'number' ? body.width : session.video.width
           session.video.height = typeof body?.height === 'number' ? body.height : session.video.height
           session.video.duration = typeof body?.duration === 'number' ? body.duration : session.video.duration
+        })
+
+        return json(toClientSession(record))
+      }
+
+      const fuelBaseColorMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/fuel-base-color$/)
+      if (request.method === 'POST' && fuelBaseColorMatch) {
+        const body = await parseBody<{ fuelBaseColor?: RGBColor | null }>(request)
+        if (!body || typeof body !== 'object' || !('fuelBaseColor' in body)) {
+          return json({ error: 'Request body must include fuelBaseColor.' }, { status: 400 })
+        }
+        const normalizedFuelBaseColor = normalizeRgbColor(body.fuelBaseColor)
+        if (!normalizedFuelBaseColor) {
+          return json(
+            { error: 'fuelBaseColor must be an RGB object like { r, g, b } with values 0-255.' },
+            { status: 400 },
+          )
+        }
+
+        const record = await updateSession(fuelBaseColorMatch[1], (session) => {
+          session.fuelBaseColor = normalizedFuelBaseColor
+          session.overlay = null
+          session.status = session.fieldQuad || session.bbox ? 'ready' : 'idle'
+        })
+
+        return json(toClientSession(record))
+      }
+
+      const fuelBaseColorSampleMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/fuel-base-color\/sample$/)
+      if (request.method === 'POST' && fuelBaseColorSampleMatch) {
+        const body = await parseBody<{ x?: number; y?: number; timeSec?: number }>(request)
+        const x = Number(body?.x)
+        const y = Number(body?.y)
+        const timeSec = Number(body?.timeSec)
+        if (![x, y, timeSec].every(Number.isFinite)) {
+          return json({ error: 'x, y, and timeSec must be numbers.' }, { status: 400 })
+        }
+        const normalizedX = clamp01(x)
+        const normalizedY = clamp01(y)
+
+        const record = await updateSession(fuelBaseColorSampleMatch[1], async (session) => {
+          const sampledColor = await sampleSessionVideoColor(session, normalizedX, normalizedY, timeSec)
+          session.fuelBaseColor = sampledColor
+          session.overlay = null
+          session.status = session.fieldQuad || session.bbox ? 'ready' : 'idle'
         })
 
         return json(toClientSession(record))
@@ -1171,11 +1537,11 @@ Bun.serve({
         return createRangeResponse(filePath, request, inferMimeType(fileName))
       }
 
-      const frameMatch = url.pathname.match(/^\/media-frame\/([^/]+)\/(\d+)\.webp$/)
+      const frameMatch = url.pathname.match(/^\/media-frame\/([^/]+)\/(\d+)\.png$/)
       if (request.method === 'GET' && frameMatch) {
         const sessionId = frameMatch[1]
         const frameIndex = Number(frameMatch[2])
-        const filePath = path.join(sessionDir(sessionId), 'overlay-frames', `frame_${frameIndex.toString().padStart(6, '0')}.webp`)
+        const filePath = path.join(sessionDir(sessionId), 'overlay-frames', `frame_${frameIndex.toString().padStart(6, '0')}.png`)
 
         if (!existsSync(filePath)) {
           return json({ error: 'Frame not found.' }, { status: 404 })

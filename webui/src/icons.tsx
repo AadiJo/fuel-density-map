@@ -250,3 +250,21 @@ export function IconCrosshair({ className, size = 20 }: IconProps) {
     </svg>
   )
 }
+
+export function IconColorPicker({ className, size = 20 }: IconProps) {
+  return (
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" aria-hidden>
+      <path {...strokeProps()} d="M14.2 4.8a2.8 2.8 0 0 1 4 4l-5.6 5.6a2 2 0 0 1-1.4.6H9.7l-.6 1.6a2 2 0 0 1-1.2 1.2l-1.2.4a.8.8 0 0 1-1-.9l.3-1.2a2 2 0 0 1 1.2-1.4l1.7-.7v-1.4c0-.5.2-1 .6-1.4l5.7-5.5Z" />
+      <path {...strokeProps()} d="m12.7 6.3 5 5" />
+    </svg>
+  )
+}
+
+export function IconReset({ className, size = 20 }: IconProps) {
+  return (
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" aria-hidden>
+      <path {...strokeProps()} d="M3 12a9 9 0 1 0 2.6-6.4" />
+      <path {...strokeProps()} d="M3 4v5h5" />
+    </svg>
+  )
+}

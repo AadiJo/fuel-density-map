@@ -15,6 +15,8 @@ import {
   IconMap,
   IconPause,
   IconPlay,
+  IconColorPicker,
+  IconReset,
   IconSidebarLeftToggle,
   IconSidebarRightToggle,
   IconTerminal,
@@ -24,19 +26,25 @@ import {
   IconXCircle,
 } from './icons'
 import type {
+  AirProfileData,
   BBox,
   DisplayMode,
   FieldMapData,
   FieldQuad,
   Point,
   ProcessingProgress,
+  RGBColor,
   Session,
   SessionStatus,
+  WallSide,
 } from './types'
+
+type CalibrationTarget = 'field' | 'wall'
 
 const SELECTED_SESSION_STORAGE_KEY = 'fuel-density-map:selected-session'
 const VIEWER_STORAGE_KEY = 'fuel-density-map:viewer'
 const FIELD_ASSET_URL = '/assets/rebuilt-field.png'
+const DEFAULT_FUEL_BASE_COLOR: RGBColor = { r: 255, g: 255, b: 0 }
 
 /** Normalized 0–1 coords on the full field PNG; must match processor_cli.py FIELD_DESTINATION_BOUNDS. */
 const FIELD_IMAGE_NORM_BOUNDS = {
@@ -64,6 +72,15 @@ const FIELD_FUEL_EXCLUSION_ZONES = [
     { x: 0.6337, y: 0.566 },
   ],
 ] as const
+
+const AIR_PROFILE_HEIGHT_BANDS = ['High', 'Mid', 'Low', 'Ground'] as const
+
+function getSessionWallQuad(session: Session | null | undefined, side: WallSide): FieldQuad | null {
+  if (!session) {
+    return null
+  }
+  return session.wallQuads?.[side] ?? (side === 'right' ? session.wallQuad : null) ?? null
+}
 
 function sortSessions(sessions: Session[]) {
   return [...sessions].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
@@ -261,6 +278,19 @@ function clamp(value: number, min = 0, max = 1) {
   return Math.min(Math.max(value, min), max)
 }
 
+function normalizeRgbByte(value: number) {
+  if (!Number.isFinite(value)) {
+    return 0
+  }
+  return Math.max(0, Math.min(255, Math.round(value)))
+}
+
+function rgbToHex(color: RGBColor) {
+  return `#${normalizeRgbByte(color.r).toString(16).padStart(2, '0')}${normalizeRgbByte(color.g)
+    .toString(16)
+    .padStart(2, '0')}${normalizeRgbByte(color.b).toString(16).padStart(2, '0')}`.toUpperCase()
+}
+
 function pointInPolygon(x: number, y: number, polygon: readonly Point[]) {
   let inside = false
   for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
@@ -291,6 +321,24 @@ function boxToPixels(box: BBox | null, session: Session | null) {
     y: Math.round(box.y * session.video.height),
     width: Math.round(box.width * session.video.width),
     height: Math.round(box.height * session.video.height),
+  }
+}
+
+function boxFromPoints(points: Point[]): BBox | null {
+  if (points.length === 0) {
+    return null
+  }
+  const xs = points.map((point) => point.x)
+  const ys = points.map((point) => point.y)
+  const minX = Math.min(...xs)
+  const maxX = Math.max(...xs)
+  const minY = Math.min(...ys)
+  const maxY = Math.max(...ys)
+  return {
+    x: minX,
+    y: minY,
+    width: Math.max(0.0001, maxX - minX),
+    height: Math.max(0.0001, maxY - minY),
   }
 }
 
@@ -370,32 +418,38 @@ function orderQuadPoints(points: Point[]): FieldQuad | null {
     return null
   }
 
-  const sums = points.map((point) => point.x + point.y)
-  const diffs = points.map((point) => point.y - point.x)
-  const tlIdx = sums.indexOf(Math.min(...sums))
-  const brIdx = sums.indexOf(Math.max(...sums))
-  const trIdx = diffs.indexOf(Math.min(...diffs))
-  const blIdx = diffs.indexOf(Math.max(...diffs))
+  const center = points.reduce(
+    (acc, point) => ({ x: acc.x + point.x / points.length, y: acc.y + point.y / points.length }),
+    { x: 0, y: 0 },
+  )
 
-  if (new Set([tlIdx, trIdx, brIdx, blIdx]).size === 4) {
-    return [points[tlIdx], points[trIdx], points[brIdx], points[blIdx]]
-  }
-
-  const sortedByY = [...points].sort((left, right) => {
-    if (left.y !== right.y) {
-      return left.y - right.y
-    }
-    return left.x - right.x
+  const sortedByAngle = [...points].sort((left, right) => {
+    const leftAngle = Math.atan2(left.y - center.y, left.x - center.x)
+    const rightAngle = Math.atan2(right.y - center.y, right.x - center.x)
+    return leftAngle - rightAngle
   })
 
-  const topRow = sortedByY.slice(0, 2).sort((left, right) => left.x - right.x)
-  const bottomRow = sortedByY.slice(2).sort((left, right) => left.x - right.x)
-  if (topRow.length !== 2 || bottomRow.length !== 2) {
+  let topEdgeStartIndex = 0
+  let bestTopEdgeScore = Number.POSITIVE_INFINITY
+  for (let index = 0; index < sortedByAngle.length; index += 1) {
+    const a = sortedByAngle[index]
+    const b = sortedByAngle[(index + 1) % sortedByAngle.length]
+    const edgeScore = (a.y + b.y) * 0.5
+    if (edgeScore < bestTopEdgeScore) {
+      bestTopEdgeScore = edgeScore
+      topEdgeStartIndex = index
+    }
+  }
+
+  const rotated = sortedByAngle.map((_, index) => sortedByAngle[(topEdgeStartIndex + index) % sortedByAngle.length])
+  if (rotated.length !== 4) {
     return null
   }
 
-  const [topLeft, topRight] = topRow
-  const [bottomLeft, bottomRight] = bottomRow
+  const [edgeTopA, edgeTopB, edgeBottomA, edgeBottomB] = rotated
+  const [topLeft, topRight] = edgeTopA.x <= edgeTopB.x ? [edgeTopA, edgeTopB] : [edgeTopB, edgeTopA]
+  const [bottomLeft, bottomRight] =
+    edgeBottomA.x <= edgeBottomB.x ? [edgeBottomA, edgeBottomB] : [edgeBottomB, edgeBottomA]
   return [topLeft, topRight, bottomRight, bottomLeft]
 }
 
@@ -500,10 +554,12 @@ function fieldQuadsEqual(a: FieldQuad | null | undefined, b: FieldQuad | null): 
 
 /** CSS px; field map uses one marker size (third tuple value in JSON is legacy). */
 const FIELD_MAP_FUEL_DOT_RADIUS_PX = 6
+const AIRBORNE_FIELD_MAP_THRESHOLD = 0.02
 
 function drawFieldMapFrame(
   canvas: HTMLCanvasElement,
   fieldMapData: FieldMapData,
+  airProfileData: AirProfileData | null,
   frameIndex: number,
   fieldImage: HTMLImageElement | null,
 ) {
@@ -531,6 +587,9 @@ function drawFieldMapFrame(
 
   const maxFrameIndex = Math.max(fieldMapData.frames.length - 1, 0)
   const activeFrame = fieldMapData.frames[Math.min(frameIndex, maxFrameIndex)] ?? []
+  const airFrameMaxIndex = Math.max((airProfileData?.frames.length ?? 0) - 1, 0)
+  const activeAirFrame = airProfileData?.frames[Math.min(frameIndex, airFrameMaxIndex)] ?? []
+  const hasAlignedAirFrame = activeAirFrame.length === activeFrame.length
 
   // Match `object-fit: contain` on `.stage-field-base`: use the displayed asset's
   // intrinsic size when loaded. If JSON width/height differ from the PNG (e.g. stale
@@ -541,8 +600,13 @@ function drawFieldMapFrame(
   const ih = nw > 0 && nh > 0 ? nh : fieldMapData.imageHeight
   const inset = computeContainedImageRect(rect.width, rect.height, iw, ih)
 
-  const r = FIELD_MAP_FUEL_DOT_RADIUS_PX
-  for (const [normalizedX, normalizedY] of activeFrame) {
+  const baseRadius = FIELD_MAP_FUEL_DOT_RADIUS_PX
+  for (const [pointIndex, [normalizedX, normalizedY]] of activeFrame.entries()) {
+    const airborneHeightNorm = hasAlignedAirFrame ? clamp((activeAirFrame[pointIndex]?.[1] ?? 0) / 10000) : 0
+    const isAirborne = airborneHeightNorm >= AIRBORNE_FIELD_MAP_THRESHOLD
+    const markerRadius = isAirborne
+      ? baseRadius * (0.72 + airborneHeightNorm * 1.1)
+      : baseRadius
     let fx = normalizedX / 10000
     let fy = normalizedY / 10000
     // Projection targets an inset quad on the asset, not 0..1 of the full bitmap; values
@@ -559,34 +623,116 @@ function drawFieldMapFrame(
       const { offsetX, offsetY, dw, dh } = inset
       x = offsetX + fx * dw
       y = offsetY + fy * dh
-      x = clamp(x, offsetX + r, offsetX + dw - r)
-      y = clamp(y, offsetY + r, offsetY + dh - r)
+      x = clamp(x, offsetX + markerRadius, offsetX + dw - markerRadius)
+      y = clamp(y, offsetY + markerRadius, offsetY + dh - markerRadius)
     } else {
       x = fx * rect.width
       y = fy * rect.height
-      x = clamp(x, r, rect.width - r)
-      y = clamp(y, r, rect.height - r)
+      x = clamp(x, markerRadius, rect.width - markerRadius)
+      y = clamp(y, markerRadius, rect.height - markerRadius)
     }
 
-    const glow = context.createRadialGradient(x, y, r * 0.2, x, y, r * 2.6)
-    glow.addColorStop(0, 'rgba(255, 232, 110, 0.62)')
-    glow.addColorStop(0.45, 'rgba(245, 212, 62, 0.34)')
-    glow.addColorStop(1, 'rgba(245, 212, 62, 0)')
+    const glow = context.createRadialGradient(x, y, markerRadius * 0.2, x, y, markerRadius * 2.8)
+    if (isAirborne) {
+      glow.addColorStop(0, 'rgba(211, 162, 255, 0.76)')
+      glow.addColorStop(0.48, 'rgba(148, 87, 255, 0.42)')
+      glow.addColorStop(1, 'rgba(112, 44, 255, 0)')
+    } else {
+      glow.addColorStop(0, 'rgba(255, 232, 110, 0.62)')
+      glow.addColorStop(0.45, 'rgba(245, 212, 62, 0.34)')
+      glow.addColorStop(1, 'rgba(245, 212, 62, 0)')
+    }
 
     context.beginPath()
-    context.arc(x, y, r * 2.6, 0, Math.PI * 2)
+    context.arc(x, y, markerRadius * 2.8, 0, Math.PI * 2)
     context.fillStyle = glow
     context.fill()
 
     context.beginPath()
-    context.arc(x, y, r, 0, Math.PI * 2)
-    context.fillStyle = 'rgba(224, 175, 34, 0.96)'
-    context.shadowColor = 'rgba(245, 212, 62, 0.32)'
-    context.shadowBlur = r * 0.95
+    context.arc(x, y, markerRadius, 0, Math.PI * 2)
+    context.fillStyle = isAirborne ? 'rgba(138, 76, 255, 0.98)' : 'rgba(224, 175, 34, 0.96)'
+    context.shadowColor = isAirborne ? 'rgba(176, 112, 255, 0.42)' : 'rgba(245, 212, 62, 0.32)'
+    context.shadowBlur = markerRadius * (isAirborne ? 1.25 : 0.95)
     context.fill()
   }
 
   context.shadowBlur = 0
+}
+
+function airProfileBandCenter(relativeHeight: number) {
+  if (relativeHeight >= 0.66) {
+    return 0.14
+  }
+  if (relativeHeight >= 0.33) {
+    return 0.39
+  }
+  if (relativeHeight >= 0.02) {
+    return 0.64
+  }
+  return 0.88
+}
+
+function drawAirProfileFrame(canvas: HTMLCanvasElement, airProfileData: AirProfileData, frameIndex: number) {
+  const rect = canvas.getBoundingClientRect()
+  if (!rect.width || !rect.height) {
+    return
+  }
+
+  const context = canvas.getContext('2d')
+  if (!context) {
+    return
+  }
+
+  const dpr = window.devicePixelRatio || 1
+  const width = Math.round(rect.width * dpr)
+  const height = Math.round(rect.height * dpr)
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width
+    canvas.height = height
+  }
+
+  context.setTransform(dpr, 0, 0, dpr, 0, 0)
+  context.clearRect(0, 0, rect.width, rect.height)
+
+  const pad = { top: 10, right: 12, bottom: 12, left: 12 }
+  const plotW = rect.width - pad.left - pad.right
+  const plotH = rect.height - pad.top - pad.bottom
+  if (plotW <= 0 || plotH <= 0) {
+    return
+  }
+
+  for (let i = 0; i <= 4; i += 1) {
+    const y = pad.top + (plotH / 4) * i
+    context.beginPath()
+    context.moveTo(pad.left, y)
+    context.lineTo(pad.left + plotW, y)
+    context.strokeStyle = 'rgba(255,255,255,0.08)'
+    context.lineWidth = 1
+    context.stroke()
+  }
+
+  const frames = airProfileData.frames ?? []
+  const activeFrame = frames[Math.min(frameIndex, Math.max(0, frames.length - 1))] ?? []
+  for (const [depth, heightNormRaw] of activeFrame) {
+    const depthNorm = clamp(depth / 10000)
+    const heightNorm = clamp(heightNormRaw / 10000)
+    const x = pad.left + depthNorm * plotW
+    const y = pad.top + airProfileBandCenter(heightNorm) * plotH
+
+    const glow = context.createRadialGradient(x, y, 0, x, y, 12)
+    glow.addColorStop(0, 'rgba(255, 226, 122, 0.9)')
+    glow.addColorStop(0.55, 'rgba(242, 193, 54, 0.35)')
+    glow.addColorStop(1, 'rgba(242, 193, 54, 0)')
+    context.fillStyle = glow
+    context.beginPath()
+    context.arc(x, y, 12, 0, Math.PI * 2)
+    context.fill()
+
+    context.fillStyle = 'rgba(241, 194, 61, 0.98)'
+    context.beginPath()
+    context.arc(x, y, 4.5, 0, Math.PI * 2)
+    context.fill()
+  }
 }
 
 function App() {
@@ -613,7 +759,11 @@ function App() {
   const [trimEndSec, setTrimEndSec] = useState(0)
   const [isTrimming, setIsTrimming] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
+  const [calibrationTarget, setCalibrationTarget] = useState<CalibrationTarget>('field')
+  const [calibrationWallSide, setCalibrationWallSide] = useState<WallSide>('right')
   const [draftFieldPoints, setDraftFieldPoints] = useState<Point[]>([])
+  const [draftLeftWallPoints, setDraftLeftWallPoints] = useState<Point[]>([])
+  const [draftRightWallPoints, setDraftRightWallPoints] = useState<Point[]>([])
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -621,8 +771,12 @@ function App() {
   const [overlayFrameIndex, setOverlayFrameIndex] = useState(0)
   const [isDeleting, setIsDeleting] = useState(false)
   const [isFieldQuadSaving, setIsFieldQuadSaving] = useState(false)
+  const [isFuelColorSaving, setIsFuelColorSaving] = useState(false)
+  const [isFuelColorPickArmed, setIsFuelColorPickArmed] = useState(false)
   const [fieldMapData, setFieldMapData] = useState<FieldMapData | null>(null)
   const [isFieldMapLoading, setIsFieldMapLoading] = useState(false)
+  const [airProfileData, setAirProfileData] = useState<AirProfileData | null>(null)
+  const [isAirProfileLoading, setIsAirProfileLoading] = useState(false)
   const [processLogOpen, setProcessLogOpen] = useState(false)
   const [processLogText, setProcessLogText] = useState('')
   const [layersPopoverOpen, setLayersPopoverOpen] = useState(false)
@@ -634,11 +788,17 @@ function App() {
   const trimPreviewVideoRef = useRef<HTMLVideoElement | null>(null)
   const fieldImageRef = useRef<HTMLImageElement | null>(null)
   const fieldCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const airProfileCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const [fieldImageLayoutTick, setFieldImageLayoutTick] = useState(0)
   const playbackFrameRef = useRef<number | null>(null)
-  const dragTargetRef = useRef<{ index: number } | null>(null)
+  const dragTargetRef = useRef<{ index: number; target: CalibrationTarget } | null>(null)
   const dragMovedRef = useRef(false)
-  const pointerDownRef = useRef<{ clientX: number; clientY: number; hitIndex: number | null } | null>(null)
+  const pointerDownRef = useRef<{
+    clientX: number
+    clientY: number
+    hitIndex: number | null
+    target: CalibrationTarget
+  } | null>(null)
 
   const [pictureLayout, setPictureLayout] = useState<{
     left: number
@@ -649,6 +809,18 @@ function App() {
   const [etaTick, setEtaTick] = useState(0)
 
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null
+  const setDraftWallPointsForSide = (
+    side: WallSide,
+    value: Point[] | ((current: Point[]) => Point[]),
+  ) => {
+    if (side === 'left') {
+      setDraftLeftWallPoints(value)
+      return
+    }
+    setDraftRightWallPoints(value)
+  }
+  const activeFuelBaseColor = selectedSession?.fuelBaseColor ?? DEFAULT_FUEL_BASE_COLOR
+  const activeFuelBaseColorHex = rgbToHex(activeFuelBaseColor)
   /** Two `<video>` elements decoding the same URL (stage + trim modal) reliably blacks out the whole tab on some Windows/GPU stacks — only one may be active. */
   const hideStageVideoForTrim =
     trimImportSession != null &&
@@ -668,11 +840,27 @@ function App() {
     draftFieldPoints.length === 4 &&
     orderedDraftQuad != null &&
     !fieldQuadsEqual(selectedSession?.fieldQuad, orderedDraftQuad)
-  const activeFieldPoints = draftFieldPoints.length > 0 ? draftFieldPoints : selectedSession?.fieldQuad ?? []
+  const activeDraftWallPoints =
+    calibrationWallSide === 'left' ? draftLeftWallPoints : draftRightWallPoints
+  const activeSavedWallQuad = getSessionWallQuad(selectedSession, calibrationWallSide)
+  const activeFieldPoints =
+    calibrationTarget === 'wall'
+      ? activeDraftWallPoints.length > 0
+        ? activeDraftWallPoints
+        : activeSavedWallQuad ?? []
+      : draftFieldPoints.length > 0
+        ? draftFieldPoints
+        : selectedSession?.fieldQuad ?? []
   const activeCornerCount =
-    draftFieldPoints.length > 0 && draftFieldPoints.length < 4 ? draftFieldPoints.length : selectedSession?.fieldQuad?.length ?? 0
+    calibrationTarget === 'wall'
+      ? activeDraftWallPoints.length > 0 && activeDraftWallPoints.length < 4
+        ? activeDraftWallPoints.length
+        : activeSavedWallQuad?.length ?? 0
+      : draftFieldPoints.length > 0 && draftFieldPoints.length < 4
+        ? draftFieldPoints.length
+        : selectedSession?.fieldQuad?.length ?? 0
   const hasIncompleteFieldSelection = draftFieldPoints.length > 0 && draftFieldPoints.length < 4
-  const activePixelBox = hasIncompleteFieldSelection ? null : boxToPixels(selectedSession?.bbox ?? null, selectedSession)
+  const activePixelBox = boxToPixels(boxFromPoints(activeFieldPoints), selectedSession)
   const overlayFrameUrl = buildOverlayFrameUrl(selectedSession?.media.overlayFrameUrlTemplate ?? null, overlayFrameIndex)
   const overlayVideoUrl = selectedSession?.media.overlayVideoUrl
     ? cacheBustUrl(selectedSession.media.overlayVideoUrl, selectedSession.updatedAt)
@@ -797,6 +985,12 @@ function App() {
       setLayersPopoverOpen(false)
     }
   }, [isMatchMode])
+
+  useEffect(() => {
+    if (!isMatchMode || !selectedSession?.media.videoUrl) {
+      setIsFuelColorPickArmed(false)
+    }
+  }, [isMatchMode, selectedSession?.id, selectedSession?.media.videoUrl])
 
   useEffect(() => {
     if (!layersPopoverOpen) {
@@ -939,6 +1133,8 @@ function App() {
 
   useEffect(() => {
     setDraftFieldPoints(selectedSession?.fieldQuad ? [...selectedSession.fieldQuad] : [])
+    setDraftLeftWallPoints(getSessionWallQuad(selectedSession, 'left') ? [...getSessionWallQuad(selectedSession, 'left')!] : [])
+    setDraftRightWallPoints(getSessionWallQuad(selectedSession, 'right') ? [...getSessionWallQuad(selectedSession, 'right')!] : [])
     setCurrentTime(0)
     setDuration(selectedSession?.video.duration ?? 0)
     setIsPlaying(false)
@@ -951,6 +1147,14 @@ function App() {
     }
     setDraftFieldPoints(selectedSession.fieldQuad ? [...selectedSession.fieldQuad] : [])
   }, [selectedSession?.id, selectedSession?.fieldQuad])
+
+  useEffect(() => {
+    if (!selectedSession) {
+      return
+    }
+    setDraftLeftWallPoints(getSessionWallQuad(selectedSession, 'left') ? [...getSessionWallQuad(selectedSession, 'left')!] : [])
+    setDraftRightWallPoints(getSessionWallQuad(selectedSession, 'right') ? [...getSessionWallQuad(selectedSession, 'right')!] : [])
+  }, [selectedSession?.id, selectedSession?.wallQuads, selectedSession?.wallQuad])
 
   useEffect(() => {
     if (selectedSession?.video.duration != null) {
@@ -1001,6 +1205,40 @@ function App() {
   }, [selectedSession?.id, selectedSession?.media.fieldMapDataUrl, selectedSession?.updatedAt])
 
   useEffect(() => {
+    const airProfileDataUrl = selectedSession?.media.airProfileDataUrl
+    setAirProfileData(null)
+
+    if (!airProfileDataUrl) {
+      setIsAirProfileLoading(false)
+      return
+    }
+
+    let isActive = true
+
+    void (async () => {
+      try {
+        setIsAirProfileLoading(true)
+        const loadedAirProfileData = await api.getAirProfileData(airProfileDataUrl)
+        if (isActive) {
+          setAirProfileData(loadedAirProfileData)
+        }
+      } catch (error) {
+        if (isActive) {
+          setErrorMessage(error instanceof Error ? error.message : 'Unable to load the air profile data.')
+        }
+      } finally {
+        if (isActive) {
+          setIsAirProfileLoading(false)
+        }
+      }
+    })()
+
+    return () => {
+      isActive = false
+    }
+  }, [selectedSession?.id, selectedSession?.media.airProfileDataUrl, selectedSession?.updatedAt])
+
+  useEffect(() => {
     if (!isFieldMode || !fieldMapData || !selectedSession?.overlay) {
       return
     }
@@ -1031,7 +1269,7 @@ function App() {
 
     const canvas = fieldCanvasRef.current
     const render = () =>
-      drawFieldMapFrame(canvas, fieldMapData, overlayFrameIndex, fieldImageRef.current)
+      drawFieldMapFrame(canvas, fieldMapData, airProfileData, overlayFrameIndex, fieldImageRef.current)
     render()
 
     const resizeObserver = new ResizeObserver(render)
@@ -1039,7 +1277,21 @@ function App() {
     return () => {
       resizeObserver.disconnect()
     }
-  }, [fieldMapData, isFieldMode, overlayFrameIndex, fieldImageLayoutTick])
+  }, [fieldMapData, airProfileData, isFieldMode, overlayFrameIndex, fieldImageLayoutTick])
+
+  useEffect(() => {
+    if (!airProfileData || !airProfileCanvasRef.current) {
+      return
+    }
+
+    const canvas = airProfileCanvasRef.current
+    const render = () => drawAirProfileFrame(canvas, airProfileData, overlayFrameIndex)
+    render()
+
+    const resizeObserver = new ResizeObserver(render)
+    resizeObserver.observe(canvas)
+    return () => resizeObserver.disconnect()
+  }, [airProfileData, overlayFrameIndex])
 
   useLayoutEffect(() => {
     if (!isFieldMode) {
@@ -1139,6 +1391,63 @@ function App() {
     }
   }
 
+  async function saveWallQuad(
+    wallSide: WallSide,
+    wallQuad: FieldQuad | null,
+    sessionIdOverride?: string,
+  ): Promise<boolean> {
+    const sessionId = sessionIdOverride ?? selectedSession?.id
+    if (!sessionId) {
+      setErrorMessage('No session selected.')
+      return false
+    }
+
+    try {
+      setIsFieldQuadSaving(true)
+      setErrorMessage(null)
+      setDraftWallPointsForSide(wallSide, wallQuad ? [...wallQuad] : [])
+      await api.saveWallQuad(sessionId, wallSide, wallQuad)
+      const fresh = await api.getSession(sessionId)
+      setDraftWallPointsForSide(wallSide, getSessionWallQuad(fresh, wallSide) ? [...getSessionWallQuad(fresh, wallSide)!] : [])
+      upsertSession(fresh)
+      return true
+    } catch (error) {
+      setDraftWallPointsForSide(wallSide, wallQuad ? [...wallQuad] : [])
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to save the wall borders.')
+      return false
+    } finally {
+      setIsFieldQuadSaving(false)
+    }
+  }
+
+  async function saveFuelBaseColor(
+    fuelBaseColor: RGBColor,
+    sessionIdOverride?: string,
+  ): Promise<boolean> {
+    const sessionId = sessionIdOverride ?? selectedSession?.id
+    if (!sessionId) {
+      setErrorMessage('No session selected.')
+      return false
+    }
+
+    try {
+      setIsFuelColorSaving(true)
+      setErrorMessage(null)
+      const updated = await api.saveFuelBaseColor(sessionId, {
+        r: normalizeRgbByte(fuelBaseColor.r),
+        g: normalizeRgbByte(fuelBaseColor.g),
+        b: normalizeRgbByte(fuelBaseColor.b),
+      })
+      upsertSession(updated)
+      return true
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to save fuel base color.')
+      return false
+    } finally {
+      setIsFuelColorSaving(false)
+    }
+  }
+
   async function handleImport(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
 
@@ -1205,6 +1514,20 @@ function App() {
           }
         }
       }
+      for (const wallSide of ['left', 'right'] as const) {
+        const draftWallPoints = wallSide === 'left' ? draftLeftWallPoints : draftRightWallPoints
+        const savedWallQuad = getSessionWallQuad(selectedSession, wallSide)
+        if (draftWallPoints.length !== 4) {
+          continue
+        }
+        const orderedWall = orderQuadPoints(draftWallPoints)
+        if (orderedWall && !fieldQuadsEqual(savedWallQuad, orderedWall)) {
+          const saved = await saveWallQuad(wallSide, orderedWall, selectedSession.id)
+          if (!saved) {
+            return
+          }
+        }
+      }
       const processed = await api.processSession(selectedSession.id)
       upsertSession(processed)
       setMode((currentMode) => (currentMode === 'field' ? 'field' : 'match'))
@@ -1232,12 +1555,22 @@ function App() {
     }
   }
 
-  function baseFieldPoints(): Point[] {
+  function baseFieldPoints(target: CalibrationTarget): Point[] {
+    if (target === 'wall') {
+      return activeDraftWallPoints.length > 0 ? activeDraftWallPoints : activeSavedWallQuad ?? []
+    }
     return draftFieldPoints.length > 0 ? draftFieldPoints : selectedSession?.fieldQuad ?? []
   }
 
   function handleDrawingPointerDown(event: React.PointerEvent<HTMLDivElement>) {
     if (isFieldMode || !selectedSession?.media.videoUrl) {
+      return
+    }
+
+    if (isFuelColorPickArmed) {
+      pointerDownRef.current = null
+      dragTargetRef.current = null
+      dragMovedRef.current = false
       return
     }
 
@@ -1250,17 +1583,19 @@ function App() {
       return
     }
 
-    const points = baseFieldPoints()
+    const target = calibrationTarget
+    const points = baseFieldPoints(target)
     const hitIndex = findNearestPointIndex(points, point)
     pointerDownRef.current = {
       clientX: event.clientX,
       clientY: event.clientY,
       hitIndex,
+      target,
     }
     dragMovedRef.current = false
 
     if (hitIndex !== null) {
-      dragTargetRef.current = { index: hitIndex }
+      dragTargetRef.current = { index: hitIndex, target }
       event.currentTarget.setPointerCapture(event.pointerId)
     }
   }
@@ -1280,7 +1615,20 @@ function App() {
     }
 
     dragMovedRef.current = true
-    const index = dragTargetRef.current.index
+    const { index, target } = dragTargetRef.current
+
+    if (target === 'wall') {
+      setDraftWallPointsForSide(calibrationWallSide, (current) => {
+        const base = current.length > 0 ? current : getSessionWallQuad(selectedSession, calibrationWallSide) ?? []
+        if (index >= base.length) {
+          return current
+        }
+        const next = [...base]
+        next[index] = point
+        return next
+      })
+      return
+    }
 
     setDraftFieldPoints((current) => {
       const base = current.length > 0 ? current : selectedSession?.fieldQuad ?? []
@@ -1295,6 +1643,38 @@ function App() {
 
   function handleDrawingPointerUp(event: React.PointerEvent<HTMLDivElement>) {
     if (isFieldMode || !selectedSession?.media.videoUrl) {
+      return
+    }
+
+    if (isFuelColorPickArmed) {
+      const sessionId = selectedSession?.id
+      const point = readPointFromPointerEvent(
+        event,
+        videoRef.current,
+        stageRef.current?.getBoundingClientRect() ?? null,
+      )
+      setIsFuelColorPickArmed(false)
+      if (!sessionId || !point) {
+        setErrorMessage('Could not sample color from the current video frame.')
+        return
+      }
+      void (async () => {
+        try {
+          setIsFuelColorSaving(true)
+          setErrorMessage(null)
+          const sampledSession = await api.sampleFuelBaseColor(
+            sessionId,
+            point.x,
+            point.y,
+            videoRef.current?.currentTime ?? 0,
+          )
+          upsertSession(sampledSession)
+        } catch (error) {
+          setErrorMessage(error instanceof Error ? error.message : 'Could not sample color from the current video frame.')
+        } finally {
+          setIsFuelColorSaving(false)
+        }
+      })()
       return
     }
 
@@ -1323,10 +1703,25 @@ function App() {
       (Math.abs(event.clientX - down.clientX) > 4 || Math.abs(event.clientY - down.clientY) > 4)
     const significantMove = dragMovedRef.current || movedPx
     dragMovedRef.current = false
+    const target = down?.target ?? calibrationTarget
 
     if (down && event.shiftKey && down.hitIndex !== null && !significantMove) {
       setErrorMessage(null)
       const removeIdx = down.hitIndex
+      if (target === 'wall') {
+        setDraftWallPointsForSide(calibrationWallSide, (current) => {
+          const base = current.length > 0 ? current : getSessionWallQuad(selectedSession, calibrationWallSide) ?? []
+          if (removeIdx >= base.length) {
+            return current
+          }
+          const next = base.filter((_, i) => i !== removeIdx)
+          if (next.length < 4) {
+            void saveWallQuad(calibrationWallSide, null)
+          }
+          return next
+        })
+        return
+      }
       setDraftFieldPoints((current) => {
         const base = current.length > 0 ? current : selectedSession?.fieldQuad ?? []
         if (removeIdx >= base.length) {
@@ -1342,6 +1737,20 @@ function App() {
     }
 
     if (hadDragTarget) {
+      if (target === 'wall') {
+        setDraftWallPointsForSide(calibrationWallSide, (current) => {
+          if (current.length !== 4) {
+            return current
+          }
+          const ordered = orderQuadPoints(current)
+          if (ordered) {
+            void saveWallQuad(calibrationWallSide, ordered)
+            return [...ordered]
+          }
+          return current
+        })
+        return
+      }
       setDraftFieldPoints((current) => {
         if (current.length !== 4) {
           return current
@@ -1365,6 +1774,30 @@ function App() {
     }
 
     setErrorMessage(null)
+    if (target === 'wall') {
+      setDraftWallPointsForSide(calibrationWallSide, (current) => {
+        const basePoints = current.length === 4 ? [] : current
+        if (basePoints.length >= 4) {
+          return current
+        }
+        const nextPoints = [...basePoints, point]
+
+        if (nextPoints.length < 4) {
+          return nextPoints
+        }
+
+        const ordered = orderQuadPoints(nextPoints)
+        if (!ordered) {
+          setErrorMessage('Pick four distinct wall corners.')
+          return []
+        }
+
+        void saveWallQuad(calibrationWallSide, ordered)
+        return [...ordered]
+      })
+      return
+    }
+
     setDraftFieldPoints((current) => {
       const basePoints = current.length === 4 ? [] : current
       if (basePoints.length >= 4) {
@@ -1686,6 +2119,46 @@ function App() {
                       </button>
                     </div>
 
+                    <div className="calibration-toggle" role="toolbar" aria-label="Calibration target">
+                      <span className="calibration-toggle__label">Calibrate</span>
+                      <button
+                        type="button"
+                        className="calibration-toggle__segment"
+                        aria-pressed={calibrationTarget === 'field'}
+                        onClick={() => setCalibrationTarget('field')}
+                        title="Edit the field calibration"
+                      >
+                        <IconMap size={16} />
+                        <span>Field</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="calibration-toggle__segment"
+                        aria-pressed={calibrationTarget === 'wall' && calibrationWallSide === 'left'}
+                        onClick={() => {
+                          setCalibrationTarget('wall')
+                          setCalibrationWallSide('left')
+                        }}
+                        title="Edit the left driver-station wall calibration"
+                      >
+                        <IconCrosshair size={16} />
+                        <span>Left Wall</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="calibration-toggle__segment"
+                        aria-pressed={calibrationTarget === 'wall' && calibrationWallSide === 'right'}
+                        onClick={() => {
+                          setCalibrationTarget('wall')
+                          setCalibrationWallSide('right')
+                        }}
+                        title="Edit the right driver-station wall calibration"
+                      >
+                        <IconCrosshair size={16} />
+                        <span>Right Wall</span>
+                      </button>
+                    </div>
+
                     <div className="layers-popover-wrap" ref={layersPopoverRef}>
                       <button
                         type="button"
@@ -1779,6 +2252,7 @@ function App() {
                         hasUnsavedFieldQuad ||
                         (!selectedSession.fieldQuad && !selectedSession.bbox) ||
                         isProcessing ||
+                        selectedSession.status === 'processing' ||
                         isFieldQuadSaving ||
                         selectedSession.status === 'downloading'
                       }
@@ -1896,7 +2370,7 @@ function App() {
                               ) : null}
 
                               <div
-                                className="stage-drawing-layer"
+                                className={`stage-drawing-layer ${isFuelColorPickArmed ? 'stage-drawing-layer--color-pick' : ''}`}
                                 onPointerDown={handleDrawingPointerDown}
                                 onPointerMove={handleDrawingPointerMove}
                                 onPointerUp={handleDrawingPointerUp}
@@ -2016,17 +2490,27 @@ function App() {
                     <p>
                       {isFieldMode
                         ? 'Field map follows the playhead. Switch to Match view to place or adjust corners.'
+                        : isFuelColorPickArmed
+                          ? 'Color picker armed: click on a fuel pixel in the video to set this session\'s detection color.'
                         : activeFieldPoints.length > 0 && activeFieldPoints.length < 4
-                          ? `${4 - activeFieldPoints.length} corner${4 - activeFieldPoints.length === 1 ? '' : 's'} left · Shift+click removes · drag to move`
-                          : 'Click four corners · drag to adjust · Shift+click removes · Restart clears all'}
+                          ? `${4 - activeFieldPoints.length} ${calibrationTarget === 'wall' ? `${calibrationWallSide} wall` : 'field'} corner${4 - activeFieldPoints.length === 1 ? '' : 's'} left · Shift+click removes · drag to move`
+                          : calibrationTarget === 'wall'
+                            ? `Click four corners on the ${calibrationWallSide} driver-station wall to improve airborne tracking on that side.`
+                            : 'Click four corners · drag to adjust · Shift+click removes · Restart clears all'}
                     </p>
                     <div className="helper-actions">
                       <button
                         className="ghost-btn"
                         onClick={() => {
-                          setDraftFieldPoints((current) =>
-                            current.length > 0 && current.length < 4 ? current.slice(0, -1) : current,
-                          )
+                          if (calibrationTarget === 'wall') {
+                            setDraftWallPointsForSide(calibrationWallSide, (current) =>
+                              current.length > 0 && current.length < 4 ? current.slice(0, -1) : current,
+                            )
+                          } else {
+                            setDraftFieldPoints((current) =>
+                              current.length > 0 && current.length < 4 ? current.slice(0, -1) : current,
+                            )
+                          }
                         }}
                         type="button"
                         disabled={activeFieldPoints.length === 0 || activeFieldPoints.length === 4}
@@ -2038,17 +2522,52 @@ function App() {
                       <button
                         className="ghost-btn"
                         onClick={() => {
-                          setDraftFieldPoints([])
-                          void saveFieldQuad(null)
+                          if (calibrationTarget === 'wall') {
+                            setDraftWallPointsForSide(calibrationWallSide, [])
+                            void saveWallQuad(calibrationWallSide, null)
+                          } else {
+                            setDraftFieldPoints([])
+                            void saveFieldQuad(null)
+                          }
                         }}
                         type="button"
-                        title="Restart field selection"
-                        aria-label="Restart field selection"
+                        title={`Restart ${calibrationTarget} selection`}
+                        aria-label={`Restart ${calibrationTarget} selection`}
                       >
                         Restart
                       </button>
                     </div>
                   </div>
+
+                  <section className="air-profile-panel" aria-label="Air profile">
+                    <div className="air-profile-panel__header">
+                      <div>
+                        <h3>Air Profile</h3>
+                        <p>Relative height above the floor across the field using the active calibrated wall. Not true physical height.</p>
+                      </div>
+                      <span className="air-profile-panel__badge">Relative only</span>
+                    </div>
+                    <div className="air-profile-panel__frame">
+                      <div className="air-profile-axis" aria-hidden>
+                        {AIR_PROFILE_HEIGHT_BANDS.map((label) => (
+                          <span key={label}>{label}</span>
+                        ))}
+                      </div>
+                      <div className="air-profile-stage">
+                        <canvas className="air-profile-canvas" ref={airProfileCanvasRef} />
+                        {!airProfileData && !isAirProfileLoading ? (
+                          <div className="air-profile-empty">
+                            {getSessionWallQuad(selectedSession, 'left') || getSessionWallQuad(selectedSession, 'right')
+                              ? 'Run processing to refresh the air profile.'
+                              : 'Wall calibration is optional. Mark the left and/or right driver-station wall to unlock airborne tracking on that side.'}
+                          </div>
+                        ) : null}
+                        {isAirProfileLoading ? (
+                          <div className="air-profile-empty">Loading air profile…</div>
+                        ) : null}
+                      </div>
+                    </div>
+                  </section>
                 </>
               ) : (
                 <div className="stage-frame stage-frame--solo">
@@ -2181,6 +2700,68 @@ function App() {
                 </div>
               ) : (
                 <p className="inspector-muted">Place four corners on the video to lock the projection.</p>
+              )}
+            </section>
+
+            <section className="inspector-card">
+              <div className="inspector-card__head">
+                <IconBlend size={16} />
+                <h3>Fuel Detection</h3>
+              </div>
+              {selectedSession ? (
+                <>
+                  <div className="fuel-color-row">
+                    <span
+                      className="fuel-color-swatch"
+                      style={{
+                        backgroundColor: `rgb(${activeFuelBaseColor.r}, ${activeFuelBaseColor.g}, ${activeFuelBaseColor.b})`,
+                      }}
+                      aria-hidden
+                    />
+                    <div className="fuel-color-values">
+                      <strong>{activeFuelBaseColorHex}</strong>
+                      <span>
+                        RGB {activeFuelBaseColor.r}, {activeFuelBaseColor.g}, {activeFuelBaseColor.b}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="fuel-color-actions">
+                    <button
+                      type="button"
+                      className={`fuel-color-icon-btn ${isFuelColorPickArmed ? 'fuel-color-icon-btn--active' : ''}`}
+                      disabled={!selectedSession.media.videoUrl || isFieldMode || isFuelColorSaving}
+                      onClick={() => {
+                        setErrorMessage(null)
+                        setIsFuelColorPickArmed((armed) => !armed)
+                      }}
+                      title={
+                        isFieldMode
+                          ? 'Switch to Match view to pick color from video'
+                          : isFuelColorPickArmed
+                            ? 'Cancel color picking'
+                            : 'Pick a color from the video'
+                      }
+                      aria-label={isFuelColorPickArmed ? 'Cancel color picker' : 'Pick fuel color from video'}
+                    >
+                      <IconColorPicker size={15} />
+                    </button>
+                    <button
+                      type="button"
+                      className="fuel-color-icon-btn"
+                      disabled={isFuelColorSaving}
+                      onClick={() => {
+                        setIsFuelColorPickArmed(false)
+                        void saveFuelBaseColor(DEFAULT_FUEL_BASE_COLOR)
+                      }}
+                      title="Reset to default fuel color"
+                      aria-label="Reset fuel color to default"
+                    >
+                      <IconReset size={15} />
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <p className="inspector-muted">Select a session to tune detection color.</p>
               )}
             </section>
 
