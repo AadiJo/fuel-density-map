@@ -1,5 +1,7 @@
 # fuel-density-map
 
+![Dashboard screenshot](images/README-Image.png)
+
 Local SPA for importing a YouTube match clip, drawing the field region to analyze, generating a fuel-density overlay, and reviewing saved sessions on your machine.
 
 ## Requirements
